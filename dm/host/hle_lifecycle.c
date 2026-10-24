@@ -12,6 +12,7 @@ void dm_host_shutdown(const char *why) {
     uint64_t t0 = now_ns(); LOG("received %s: graceful exit", why);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
         LOG("[RED] graceful exit not done in 1.5 seconds, exiting at once"); _exit(0); });
+    { void dm_cloud_flush(double); dm_cloud_flush(1.0); }   // cloud save: upload a save not yet pushed (within the 1.5 s of this exit)
     hlecount_flush();                               // DM_HLECOUNT: _exit does not run atexit, write a copy here
     dm_audio_suspend(1);
     dm_gfx_suspend(1);

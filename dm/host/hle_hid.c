@@ -1,6 +1,7 @@
 // nn::hid (controller): on the real device shared memory is read through the hid service; the host takes the current state written by the front end (Mac keyboard / controller, iOS virtual gamepad / controller).
 // Generic, game-independent version: one standard controller. DM_OPMODE=0 (handheld) → handheld controller (Npad id 0x20); otherwise → 1P full-key controller (id 0).
-// Six-axis sensor: one per connected controller (two for handheld), at rest lying flat, shaken side to side while the front end holds DM_BTN_SHAKE (see the six-axis section below).
+// Six-axis sensor: one per connected controller (two for handheld): a physical controller's motion sensors when the front end has them (dm_motion_set), otherwise at rest lying flat,
+// shaken side to side while the front end holds DM_BTN_SHAKE (see the six-axis section below).
 // Vibration, mouse, keyboard: not provided by the host (device count 0 / not connected); the controller applet reports "1 player, current controller selected".
 #include "hle.h"
 #include "dm_input.h"
@@ -172,12 +173,68 @@ enum { SIX_PERIOD_NS = 5000000 };
 #define SHAKE_G 3.0
 #define SHAKE_REV 1.5
 static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < atomic_load(&g_shake_end); }
+// A physical controller's motion sensors (dm_motion_set, called by the front end at the controller's rate): acceleration and angular velocity mapped into the Switch frame,
+// angle and direction integrated from the angular velocity (no fusion: the direction drifts slowly, as the real sensor's does with fusion off). Every entry of a history read gets the
+// newest values, so a game summing angular velocity over the entries it has not seen yet gets the rotation of that time span
+// DM_GYRO_AXES=<a>,<b>,<c>: the GameController axis (x, y or z, optionally negated) giving each Switch axis (default x,y,z); DM_GYRO_LOG=1 logs the mapped values twice a second, for checking the mapping
+typedef struct { float acc[3], gyro[3], angle[3]; double rot[9]; uint64_t t; } motion_t;   // rot: the controller's axes in the world frame (columns), from the first sample
+static motion_t g_mo; static pthread_mutex_t g_mo_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_axis_src[3] = {0, 1, 2}; static double g_axis_sgn[3] = {1, 1, 1};
+enum { MOTION_FRESH_NS = 250000000 };
+static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+static void motion_axes_init(void) {
+    const char *e = getenv("DM_GYRO_AXES"); if (!e || !*e) return;
+    int src[3]; double sgn[3]; const char *p = e;
+    for (int i = 0; i < 3; i++) {
+        sgn[i] = 1; if (*p == '-') { sgn[i] = -1; p++; } else if (*p == '+') p++;
+        if (*p < 'x' || *p > 'z') { LOG("[RED] DM_GYRO_AXES=%s: expected three of x, y, z (each optionally negated), comma-separated; using x,y,z", e); return; }
+        src[i] = *p++ - 'x'; if (i < 2 && *p++ != ',') { LOG("[RED] DM_GYRO_AXES=%s: expected commas between the axes; using x,y,z", e); return; }
+    }
+    memcpy(g_axis_src, src, sizeof src); memcpy(g_axis_sgn, sgn, sizeof sgn);
+}
+void dm_motion_set(const double rot[3], const double acc[3]) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, motion_axes_init);
+    static int logon = -1; if (logon < 0) logon = getenv("DM_GYRO_LOG") != NULL;
+    double w[3], a[3];
+    for (int i = 0; i < 3; i++) { w[i] = g_axis_sgn[i] * rot[g_axis_src[i]]; a[i] = g_axis_sgn[i] * acc[g_axis_src[i]]; }
+    uint64_t t = mono_ns();
+    pthread_mutex_lock(&g_mo_mu);
+    motion_t *m = &g_mo;
+    if (!m->t || t - m->t > MOTION_FRESH_NS) { memset(m->angle, 0, sizeof m->angle); memset(m->rot, 0, sizeof m->rot); m->rot[0] = m->rot[4] = m->rot[8] = 1; m->t = t; }
+    double dt = (double)(t - m->t) / 1e9;
+    // rot ← rot · exp([w]× dt): the angular velocity is in the controller's own frame (Rodrigues' formula for the step's rotation)
+    double th = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) * dt;
+    if (th > 1e-9) {
+        double k[3] = {w[0] * dt / th, w[1] * dt / th, w[2] * dt / th}, c = cos(th), sn = sin(th), v = 1 - c, r[9], n[9];
+        r[0] = c + k[0] * k[0] * v;        r[1] = k[0] * k[1] * v - k[2] * sn; r[2] = k[0] * k[2] * v + k[1] * sn;
+        r[3] = k[1] * k[0] * v + k[2] * sn; r[4] = c + k[1] * k[1] * v;        r[5] = k[1] * k[2] * v - k[0] * sn;
+        r[6] = k[2] * k[0] * v - k[1] * sn; r[7] = k[2] * k[1] * v + k[0] * sn; r[8] = c + k[2] * k[2] * v;
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) n[i * 3 + j] = m->rot[i * 3] * r[j] + m->rot[i * 3 + 1] * r[3 + j] + m->rot[i * 3 + 2] * r[6 + j];
+        memcpy(m->rot, n, sizeof n);
+    }
+    for (int i = 0; i < 3; i++) { m->acc[i] = (float)a[i]; m->gyro[i] = (float)(w[i] / (2 * M_PI)); m->angle[i] += (float)(w[i] / (2 * M_PI) * dt); }   // revolutions / s, revolutions
+    m->t = t;
+    pthread_mutex_unlock(&g_mo_mu);
+    static uint64_t last_log; static int first = 1;
+    if (first || (logon && t - last_log > 500000000)) { first = 0; last_log = t;
+        LOG("controller motion%s: acceleration %.2f %.2f %.2f G, angular velocity %.2f %.2f %.2f rev/s (Switch frame)", logon ? "" : " sensors in use (DM_GYRO_LOG=1 logs them)", a[0], a[1], a[2], w[0] / (2 * M_PI), w[1] / (2 * M_PI), w[2] / (2 * M_PI)); }
+}
+static int motion_get(motion_t *out) {
+    pthread_mutex_lock(&g_mo_mu); *out = g_mo; pthread_mutex_unlock(&g_mo_mu);
+    return out->t && mono_ns() - out->t <= MOTION_FRESH_NS;
+}
 static void six_sample(SixAxisState *s, int64_t samp) {
     memset(s, 0, sizeof *s);
     uint64_t t = (uint64_t)samp * SIX_PERIOD_NS;
     s->delta_ns = SIX_PERIOD_NS; s->sampling = samp; s->attributes = 1;   // IsConnected
     s->acc[2] = -1;
     double yaw = 0;
+    motion_t m;
+    if (!shaking(t) && motion_get(&m)) {
+        memcpy(s->acc, m.acc, sizeof s->acc); memcpy(s->gyro, m.gyro, sizeof s->gyro); memcpy(s->angle, m.angle, sizeof s->angle);
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) s->dir[i * 3 + j] = (float)m.rot[j * 3 + i];   // row i = the controller's axis i in the world frame
+        return;
+    }
     if (shaking(t)) {
         double ph = 2 * M_PI * SHAKE_HZ * (double)(t - atomic_load(&g_shake_t0)) / 1e9;
         s->acc[0] = (float)(SHAKE_G * sin(ph));
@@ -286,7 +343,9 @@ HLE_FORCE("_ZN2nn3hid16GetGestureStatesEPNS0_12GestureStateEi", "gesture states:
 // Six-axis details: the current state, at rest unless shaking, fusion off
 HLE_FORCE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor; always sampling on the host", void, h_hid_SixStop, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", "six-axis sensor current state", void, h_hid_SixState, SixAxisState *s, const uint32_t *h) { six_states(s, 1, *h); }
-HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "six-axis sensor at rest: yes unless shaking", unsigned, h_hid_SixRest, const uint32_t *h) { (void)h; return !shaking(guest_ns()); }
+HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "six-axis sensor at rest: yes unless shaking", unsigned, h_hid_SixRest, const uint32_t *h) { (void)h;
+    motion_t m; if (motion_get(&m)) return fabsf(m.gyro[0]) + fabsf(m.gyro[1]) + fabsf(m.gyro[2]) < 0.01f;   // a real controller: at rest while it barely turns
+    return !shaking(guest_ns()); }
 // The console's own six-axis sensor (SevenSixAxisSensor, the body's orientation in handheld mode; The Legend of Zelda: Breath of the Wild): takes a work buffer and is switched through the hid service. The host provides none: switching succeeds, 0 states
 HLE_FORCE("_ZN2nn3hid28InitializeSevenSixAxisSensorEPvm", "console six-axis sensor initialization; not provided by the host", Result, h_hid_SevenInit, void *buf, size_t n) { (void)buf; (void)n; return RES_OK; }
 HLE_FORCE("_ZN2nn3hid26FinalizeSevenSixAxisSensorEv", "console six-axis sensor", Result, h_hid_SevenFini, void) { return RES_OK; }

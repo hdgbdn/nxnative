@@ -2,7 +2,7 @@
 # cb_extent.py <dmsh_b version dir> <output tsv>: how far into each uniform slot (cbuf binding) a shader can read, from the translated MSL. A line lists, per shader key, the slots whose
 # reads are all proven to stay inside the first <bytes> bytes: `<key>\t<reg>:<bytes> ...` (reg as in the reflection json, bytes a multiple of 16). A slot left out may be read anywhere in its
 # binding. Indices are bounded with c1_guard.py's interval arithmetic; any other use of the binding's name (a pointer handed on, a member other than _m0) leaves the slot out.
-# `s<reg>` marks a storage slot the shader never writes (unwritten); the host notes GPU writes for every other storage binding (nvn_mtl.m sbw_note).
+# `s<reg>` marks a storage slot the shader never writes (unwritten); the host notes GPU writes for every other storage binding reflected rw (nvn_mtl.m sbw_note).
 # The host (nvn_mtl.m cb_ext) reads only that much of a binding when it has to copy one: a uniform block the game updates in part inside a render pass (ubp_get). Breath of the Wild binds
 # a 64 KiB block to the vertex stage and updates its first 64 bytes 221 times a frame, while its vertex shaders read at most 544 bytes of it.
 # The host loads the table only when its header names its chain version (like c1_full.tsv); regenerate it after each shader build
@@ -45,8 +45,8 @@ WRITE = re.compile(r"\s*(?:=(?!=)|[-+*/%&|^]=|<<=|>>=|\+\+|--)")
 
 def unwritten(source, bindings):
     """The storage slots (sbuf bindings) the shader never writes: every use of the name is (*<set>.<name>)._m0[...] read as a value. A use followed by an assignment, after
-    an address-of (atomics take &...), or of any other form (the pointer handed to a function) counts as a write. SPIRV-Cross types every storage buffer Ryujinx emits as
-    writable (device, not const device), so the host takes a binding as written unless the table lists it"""
+    an address-of (atomics take &...), or of any other form (the pointer handed to a function) counts as a write. The host notes GPU writes for a binding the reflection marks
+    rw (Ryujinx's write flag, which covers the whole slot) unless the table lists it"""
     out = []
     for b in bindings:
         if b.get("kind") != "sbuf" or "reg" not in b: continue

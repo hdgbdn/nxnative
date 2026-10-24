@@ -441,7 +441,7 @@ def reflect(key, stage, msl, res):
             elif b and b['cb_slot'] >= 3:   # the address is in the game's own uniform buffer c[n] = uniform slot n - 3 (Monster Hunter Rise's compute shaders: c3 + 0x38); the replay reads it there
                 e.update(kind='sbuf_ubo', reg=b['cb_slot'] - 3, off=b['cb_offset'] * 4)
             else: e['reg'] = (off - base) // 16 if off is not None and base is not None and 0 <= off - base < 0x100 and (off - base) % 16 == 0 else None
-            e['rw'] = bool(b and b['flags'] & 2)
+            e['rw'] = bool(b and b['flags'] & 1)   # BufferUsageFlags.Write (1 << 0): the shader stores to the buffer or uses atomics on it
     return binds
 
 DRV_FILL = {0: [(b, b + 0x100) for b in sorted(SSBO.values())],   # c0: storage buffer address tables (vertex / compute / pixel, 16 slots × 0x10 each)

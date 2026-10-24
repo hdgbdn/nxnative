@@ -2,6 +2,8 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CAMetalDisplayLink.h>
+#import <MetalFX/MetalFX.h>   // present upscaling (fx_t)
+#undef I   // MetalFX brings in <complex.h>, whose I macro this file does not use (it names a local table I)
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <mach/mach_time.h>
@@ -322,7 +324,7 @@ void mtl_init(void) {
     g_present_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_present_args) MDIE("failed to create the present argument table: %s", ate.localizedDescription.UTF8String);
     for (int i = 0; i < 3; i++) {
-        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 16 options:MTLResourceStorageModeShared];   // the present pass, then the copy pass of the MetalFX path (present_encode_m4)
         if (!g_present_uv[i]) MDIE("failed to create present UV buffer[%d]", i);
         res_add(g_present_uv[i]);
     }
@@ -1159,7 +1161,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[109];
+static int g_red_once[110];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -1408,6 +1410,10 @@ static NSMutableArray *g_up_texs;   // Target textures in the batch: before the 
 static id<MTLBuffer> g_up_block;
 static size_t g_up_block_off, g_up_block_size;
 static NSMutableArray *g_up_keep;
+// Staging made for the open batch beyond its slot's own block. Past UP_BATCH_CAP the batch is committed before the next texture starts (up_room): with three slots, up_begin waits for the batch
+// three back, so staging alive stays within about three caps however many textures one submission re-uploads
+#define UP_BATCH_CAP (256u << 20)
+static size_t g_up_batch_bytes;
 
 
 // The upload command buffer was discarded by the system (dropped along during GPU error recovery; the first frame on entering Travincal drops one every run): the objects of this batch of textures are built and the timestamps updated, but the content was never written in,
@@ -1435,6 +1441,10 @@ static void up_flush(void) {
     unsigned slot = (g_up_seq - 1) % 3;
     NSMutableArray *dsts = [NSMutableArray arrayWithCapacity:(NSUInteger)g_nup_blits]; for (int i = 0; i < g_nup_blits; i++) if (g_up_blits[i].dst) [dsts addObject:g_up_blits[i].dst];
     static int lost_at = -2; static uint64_t batch_n; if (lost_at == -2) { const char *e = getenv("DM_TEST_UP_LOST"); lost_at = e ? atoi(e) : -1; } int fake_lost = dsts.count && lost_at > 0 && (int)++batch_n == lost_at;
+    // This batch's staging (blocks switched out, the current block unless it is the slot's own, CPU-path buffers) is read only by this command buffer: retire it when it completes.
+    // It used to wait for the next main submission's fence, which does not pass while one long submission keeps uploading: Tears of the Kingdom re-uploaded 219 textures (3.4 GB) inside
+    // one submission, its staging reached 6.6 GB alive and GPU memory 12.6 GB within a second, and in a longer burst the wired memory filled a 24 GB Mac and the GPU driver panicked the kernel
+    NSMutableArray *retire = [NSMutableArray arrayWithArray:g_up_keep ?: @[]]; if (g_up_block && g_up_block != g_up_slot_blk[slot]) [retire addObject:g_up_block];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
     atomic_fetch_add(&g_up_pending, 1);
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
@@ -1444,6 +1454,7 @@ static void up_flush(void) {
             pthread_mutex_lock(&g_smu); g_ser_gen++; pthread_mutex_unlock(&g_smu);   // Make the view cache of every texture ID take the slow path once (on a cache hit tex_mtl is not passed through and this record is not seen)
             MLOG("%supload command buffer dropped: the %lu textures of this batch are marked unwritten and re-uploaded on next use (%d awaiting re-upload)", fake_lost ? "DM_TEST_UP_LOST: " : "", (unsigned long)dsts.count, n);
         }
+        @autoreleasepool { for (id<MTLResource> r in retire) res_remove(r); [retire removeAllObjects]; }
         double d = f.GPUEndTime - f.GPUStartTime;
         if (d > 0) atomic_fetch_add(&g_upload_gpu_ns, (uint64_t)(d * 1e9));
         atomic_store(&g_up_alloc_busy[slot], 0);
@@ -1454,8 +1465,7 @@ static void up_flush(void) {
     [cb endCommandBuffer];
     id<MTL4CommandBuffer> buffers[] = {cb};
     [g_q4 commit:buffers count:1 options:o];
-    g_up_cb = nil; if (g_up_block) { if (g_up_block != g_up_slot_blk[slot]) defer_obj_release(g_up_block); g_up_block = nil; } g_up_block_off = g_up_block_size = 0;   // the slot's own block stays (UP_SLOT_BLOCK)
-    for (id obj in g_up_keep) defer_obj_release(obj);
+    g_up_cb = nil; g_up_block = nil; g_up_block_off = g_up_block_size = 0; g_up_batch_bytes = 0;   // the slot's own block stays (UP_SLOT_BLOCK); the rest is in retire
     [g_up_keep removeAllObjects];
     up_diag();
     g_nup_blits = 0;
@@ -1477,6 +1487,8 @@ static void up_begin(void) {
     if (!g_up_texs) g_up_texs = [NSMutableArray array];
     if (!g_up_keep) g_up_keep = [NSMutableArray array];
 }
+// Before a texture's staging is cut: commit the open batch first when it already holds UP_BATCH_CAP of staging (up_flush flushes its copies; nothing of this texture is in it yet)
+static void up_room(size_t n) { if (g_up_cb && g_up_batch_bytes && g_up_batch_bytes + n > UP_BATCH_CAP) { up_flush(); up_begin(); } }
 
 // Diagnostic readout (low frequency; printed only when the block switch count changed and ≥ 1 second since the last line, at most 200 lines per game): how many times an upload batch ran out of staging block and switched blocks midway; GPU allocated, residency set object count, deferred-release queue length.
 // If the old block is not retired on a switch it stays in the residency set and can never be freed, and "GPU allocated" climbs one block at a time with the switch count
@@ -1507,7 +1519,7 @@ static id<MTLBuffer> up_alloc(size_t n, size_t *off) {
         // The old block and the "current block" retired at flush are two objects, so nothing is retired twice
         g_up_blocks_new++; if (g_up_block) { g_up_swaps++; g_up_swap_bytes += g_up_block_size; if (!g_up_old) g_up_old = [NSHashTable weakObjectsHashTable]; [g_up_old addObject:g_up_block]; static int leak = -1; if (leak < 0) leak = getenv("DM_TEST_UP_LEAK") != NULL;   // test switch DM_TEST_UP_LEAK=1: do not retire the old block, as before the fix (for comparison, to measure the leak)
             if (!leak && g_up_block != g_up_slot_blk[g_up_cur_slot]) { if (!g_up_keep) g_up_keep = [NSMutableArray array]; [g_up_keep addObject:g_up_block]; } }   // the slot's block is not retired: it stays for the slot's later batches
-        g_up_block_size = n > UP_BLOCK_SIZE ? need : UP_BLOCK_SIZE;
+        g_up_block_size = n > UP_BLOCK_SIZE ? need : UP_BLOCK_SIZE; g_up_batch_bytes += g_up_block_size;
         g_up_block = [g_dev newBufferWithLength:g_up_block_size options:MTLResourceStorageModePrivate];
         if (!g_up_block) MDIE("failed to create the swizzled-upload staging block %#zx", g_up_block_size);
         res_add(g_up_block);
@@ -1605,7 +1617,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     if (g_nvn_deswz_gpu && !use_gpu && !sparse) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
     if (use_gpu) {
         // The GPU reads the memory pool at execution time, which is closer to a real Switch than a snapshot at CPU upload time; the dirty-page stamp is still taken before encoding, and later writes still trigger a re-upload.
-        up_begin();
+        up_begin(); up_room(total);
         size_t stg_off;
         id<MTLBuffer> stg = up_alloc(total ? total : 16, &stg_off);
         size_t off = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits;
@@ -1635,9 +1647,9 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         if (!(part = malloc(t->L.size ? t->L.size : 1))) MDIE("sparse texture copy of %llu bytes failed", (unsigned long long)t->L.size);
         nvn_sparse_copy(t->pool, part, (uint64_t)(uintptr_t)t->mem, t->L.size); src = part;
     }
-    up_begin();
+    up_begin(); up_room(total);
     id<MTLBuffer> stg = [g_dev newBufferWithLength:total ? total : 16 options:MTLResourceStorageModeShared];
-    res_add(stg); [g_up_keep addObject:stg];
+    res_add(stg); [g_up_keep addObject:stg]; g_up_batch_bytes += total;
     size_t off = 0;
     int zb = zblock_on() && t->d.format >= 0x79 && t->d.format <= 0x94; if (zb) { g_zb_ser = t->serial; g_zb_n = (int)MIN(d.mipmapLevelCount, 16u); memset(g_zb, 0, sizeof g_zb); memset(g_zb_tot, 0, sizeof g_zb_tot); }
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
@@ -1902,6 +1914,42 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     tex_put(t->serial, mt);
     return mt;
 }
+// GPU memory by kind (printed with the memory readout): every resident Metal resource, summed by allocatedSize. Buffer-backed textures and buffers that wrap guest memory are the guest's own pages, not extra;
+// the rest is what the host adds on top of the game (textures it copied out of the pools, render targets, depth, arenas). The largest single textures follow, to see which render targets cost most.
+static BOOL mtl_pf_depth(MTLPixelFormat f) { return f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float || f == MTLPixelFormatStencil8 || f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatX32_Stencil8; }
+static void mtl_gpu_census(void) {
+    enum { K_RT, K_DEPTH, K_SAMPLED_BC, K_SAMPLED, K_TEX_OF_BUFFER, K_BUF_PRIVATE, K_BUF_SHARED, K_N };
+    static const char *k_name[K_N] = {"render targets", "depth/stencil", "compressed textures", "other textures", "buffer-backed textures", "private buffers", "shared buffers"};
+    uint64_t bytes[K_N] = {0}, count[K_N] = {0}; struct { uint64_t b; unsigned w, h, d, lv, pf, ms; int rt; } top[6] = {{0}};
+    @autoreleasepool {   // objects read from a weak table come back retained + autoreleased, and the frame hook has no pool that drains
+        pthread_mutex_lock(&g_res_mu);
+        NSArray *all = g_res_objects ? g_res_objects.allObjects : @[];
+        pthread_mutex_unlock(&g_res_mu);
+        for (id<MTLResource> r in all) {
+            uint64_t sz = r.allocatedSize; int k;
+            if ([r conformsToProtocol:@protocol(MTLTexture)]) {
+                id<MTLTexture> t = (id<MTLTexture>)r;
+                if (t.parentTexture) continue;   // a view of another texture: its storage is counted with the parent
+                if (t.buffer) k = K_TEX_OF_BUFFER;
+                else if (mtl_pf_depth(t.pixelFormat)) k = K_DEPTH;
+                else if (t.usage & MTLTextureUsageRenderTarget) k = K_RT;
+                else if (t.pixelFormat >= MTLPixelFormatBC1_RGBA && t.pixelFormat <= MTLPixelFormatBC7_RGBAUnorm_sRGB) k = K_SAMPLED_BC;
+                else k = K_SAMPLED;
+                if (k != K_TEX_OF_BUFFER) for (int i = 0; i < 6; i++) if (sz > top[i].b) {
+                    for (int j = 5; j > i; j--) top[j] = top[j - 1];
+                    top[i].b = sz; top[i].w = (unsigned)t.width; top[i].h = (unsigned)t.height; top[i].d = (unsigned)(t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray ? 6 : t.depth * t.arrayLength);
+                    top[i].lv = (unsigned)t.mipmapLevelCount; top[i].pf = (unsigned)t.pixelFormat; top[i].ms = (unsigned)t.sampleCount; top[i].rt = (t.usage & MTLTextureUsageRenderTarget) != 0; break; }
+            } else k = ((id<MTLBuffer>)r).storageMode == MTLStorageModePrivate ? K_BUF_PRIVATE : K_BUF_SHARED;
+            bytes[k] += sz; count[k]++;
+        }
+    }
+    char line[512]; int o = 0;
+    for (int k = 0; k < K_N && o < 480; k++) o += snprintf(line + o, sizeof line - o, "%s%s %llu MB (%llu)", k ? ", " : "", k_name[k], (unsigned long long)(bytes[k] >> 20), (unsigned long long)count[k]);
+    MLOG("GPU memory by kind (resident resources, MB (count)): %s", line);
+    o = 0; line[0] = 0;
+    for (int i = 0; i < 6 && top[i].b && o < 440; i++) o += snprintf(line + o, sizeof line - o, "%s%ux%ux%u %s format %u lv%u ms%u %llu MB", i ? "; " : "", top[i].w, top[i].h, top[i].d, top[i].rt ? "RT" : "tex", top[i].pf, top[i].lv, top[i].ms, (unsigned long long)(top[i].b >> 20));
+    MLOG("largest textures: %s", line);
+}
 // Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
 // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
 // Called by the frame hook every 300 frames; printed only when resident or GPU allocated changed by ≥ 64 MB since the last line, otherwise one line every 3000 frames; capped at 400 lines per game. All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting)
@@ -1929,6 +1977,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
     MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
+    mtl_gpu_census();
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf);
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed "
@@ -2371,6 +2420,15 @@ static int rt_dup_slot(const p_set_rt *r, int i) {
     }
     return 0;
 }
+// The depth a clear stores, as a draw at that depth would. Metal's clear of a Depth16Unorm target truncates (0.5 -> 32767, 0.25 -> 16383) while depth from the rasterizer or
+// a fragment shader rounds to nearest even (32768, 16384), as Maxwell does for clears and draws alike. So a clear value off the 16-bit grid, matched later with depth EQUAL,
+// failed by one step: Tears of the Kingdom classifies its 64 px tiles into a D16 target cleared to 0.5 and shades each class with a full-screen draw at the class's depth (EQUAL),
+// and every tile left at the clear missed its draw (Ultrahand's tint, in screen-aligned blocks). The clear value is moved onto the grid point the draw would reach, plus a
+// quarter step so the truncation lands on it
+static double clear_depth(MTLPixelFormat pf, double v) {
+    v = v > 0 ? (v < 1 ? v : 1) : 0;
+    return pf == MTLPixelFormatDepth16Unorm ? fmin((rint(v * 65535.0) + 0.25) / 65535.0, 1.0) : v;
+}
 static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v) {
     id<MTLTexture> base = tex_mtl(t); a.texture = base;
     if (has_v && v->set_levels) a.level = v->base_level;
@@ -2450,7 +2508,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         if (pd.depthAttachment.texture) {
             any = 1;
             pd.depthAttachment.loadAction = R.clear_d ? MTLLoadActionClear : MTLLoadActionLoad;
-            pd.depthAttachment.clearDepth = R.cd; pd.depthAttachment.storeAction = MTLStoreActionStore;
+            pd.depthAttachment.clearDepth = clear_depth(pd.depthAttachment.texture.pixelFormat, R.cd); pd.depthAttachment.storeAction = MTLStoreActionStore;
             MTLPixelFormat pf = pd.depthAttachment.texture.pixelFormat;
             if (clear_only != 4 && (pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatStencil8)) {   // 4: depth only
                 pd.stencilAttachment.texture = pd.depthAttachment.texture; pd.stencilAttachment.level = pd.depthAttachment.level;
@@ -4393,8 +4451,8 @@ static int fz_next(fz_cursor *c, const uint8_t **out, op_hdr *oh, const void **o
                 else if (c->rest_i < g_nrest) c->p = (const uint8_t *)g_rest[c->rest_i++];
                 else { c->p = NULL; return 0; }
                 continue;
-            case OP_JUMP: memcpy(&c->p, a, 8); continue;
-            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (c->ret_n >= 8) { c->bad = 1; return 0; }
+            case OP_JUMP: memcpy(&c->p, a, 8); if (!cmd_handle_ok((uint64_t)(uintptr_t)c->p)) { c->bad = 1; return 0; } continue;
+            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (c->ret_n >= 8 || !cmd_handle_ok(t)) { c->bad = 1; return 0; }
                 c->ret[c->ret_n++] = c->p + h.size; c->p = (const uint8_t *)t; continue; }
             default: break;
         }
@@ -4461,8 +4519,8 @@ static int ds_scan(const uint8_t *p, ds_st *ds, int depth) {
         if (g_hoist_n && hoist_skipped(p)) { p += h.size; continue; }   // Clear pass already executed early
         switch (h.op) {
             case OP_END: return DS_RET;
-            case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
-            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (depth >= 8) return DS_USED;
+            case OP_JUMP: { uint64_t t; memcpy(&t, a, 8); if (!cmd_handle_ok(t)) return DS_USED; p = (const uint8_t *)t; continue; }
+            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (depth >= 8 || !cmd_handle_ok(t)) return DS_USED;
                 int r = ds_scan((const uint8_t *)t, ds, depth + 1); if (r != DS_RET) return r; break; }
             case OP_SET_RT: case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_UPDATE_UB: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX: case OP_DISPATCH: return DS_FREE;
             case OP_CLEAR_COLOR: case OP_CLEAR_DS: g_ds_why = h.op; return DS_USED;
@@ -4846,8 +4904,8 @@ static void sdx_walk(const uint8_t *p, int depth) {
         uint32_t seq = g_sdx_nop; g_sdx_op[g_sdx_nop++] = p;
         switch (h.op) {
             case OP_END: return;
-            case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
-            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); sdx_walk((const uint8_t *)t, depth + 1); break; }
+            case OP_JUMP: { uint64_t t; memcpy(&t, a, 8); if (!cmd_handle_ok(t)) return; p = (const uint8_t *)t; continue; }
+            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (cmd_handle_ok(t)) sdx_walk((const uint8_t *)t, depth + 1); break; }
             case OP_SET_RT: { const p_set_rt *r = a; g_pp_rt = r; g_pp_rtseq = seq; seq_push(&g_rtx_seq, &g_rtx_n, &g_rtx_cap, seq);
                 for (int k = 0; k < r->n && k < 8; k++) if (r->color[k]) sdx_bucket(r->color[k]->serial, 1);
                 if (r->depth) sdx_bucket(r->depth->serial, 1);
@@ -4964,7 +5022,7 @@ static void hoist_try(void) {
         op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
         switch (h.op) {
             case OP_END: case OP_CALL: case OP_COPY_T2T: case OP_COPY_B2T: case OP_COPY_T2B: case OP_CLEAR_TEX: case OP_DISPATCH: case OP_RENDER_COND: return;
-            case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
+            case OP_JUMP: { uint64_t t; memcpy(&t, a, 8); if (!cmd_handle_ok(t)) return; p = (const uint8_t *)t; continue; }
             case OP_DRAW: case OP_DRAW_IDX: if (in_grp) return; break;
             case OP_SCISSOR: sc = *(const p_scissor *)a; has_sc = 1; break;
             case OP_BIND_TEX: case OP_BIND_IMG: { const p_bind_handles *b = a; bh_fresh(b); for (int k = 0; k < b->n && k < 32 && nbh < 512; k++) if (b->h[k]) bh[nbh++] = b->h[k]; break; }
@@ -5250,7 +5308,7 @@ static void defer_try(const p_draw *dw, const p_draw_idx *di) {
         switch (h.op) {
             case OP_END: { const uint8_t *nx = defer_cont(&ci); if (!nx) { g_defer.reason = 1; goto fail; } p = nx; continue; }
             case OP_CALL: g_defer.reason = 2; goto fail;
-            case OP_JUMP: memcpy(&p, a, 8); continue;
+            case OP_JUMP: memcpy(&p, a, 8); if (!cmd_handle_ok((uint64_t)(uintptr_t)p)) { g_defer.reason = 2; goto fail; } continue;
             case OP_BIND_PROGRAM: pg = ((const p_bind_program *)a)->prog; break;
             case OP_BIND_TEX: case OP_BIND_IMG: { const p_bind_handles *b = a; bh_fresh(b); int lim = h.op == OP_BIND_IMG ? 32 : NTEX;
                 if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= lim) for (int k = 0; k < b->n; k++) { if (h.op == OP_BIND_IMG) img[b->stage][b->first + k] = b->h[k]; else tex[b->stage][b->first + k] = b->h[k]; } break; }
@@ -5281,7 +5339,7 @@ static void defer_try(const p_draw *dw, const p_draw_idx *di) {
                 if (shared) {   // An empty render pass (targets set, then changed again without drawing or clearing) touches no attachment: it is neither taken as Q nor counted as a conflict
                     const uint8_t *e = p + h.size; int ec = ci, empty = 0;
                     for (int g2 = 0; g2 < 200000; g2++) { op_hdr he; memcpy(&he, e, sizeof he);
-                        if (he.op == OP_JUMP) { memcpy(&e, e + 8, 8); continue; }
+                        if (he.op == OP_JUMP) { memcpy(&e, e + 8, 8); if (!cmd_handle_ok((uint64_t)(uintptr_t)e)) break; continue; }
                         if (he.op == OP_END) { const uint8_t *nx = defer_cont(&ec); if (!nx) break; e = nx; continue; }
                         if (he.op == OP_SET_RT) { empty = 1; break; }
                         if (he.op == OP_DRAW || he.op == OP_DRAW_IDX || he.op == OP_CLEAR_COLOR || he.op == OP_CLEAR_DS || he.op == OP_CALL || he.op == OP_DISPATCH || he.op == OP_CLEAR_TEX || he.op == OP_COPY_T2T || he.op == OP_COPY_B2T || he.op == OP_COPY_T2B) break;
@@ -5297,7 +5355,7 @@ fail:
     if (g_defer.reason && passdump()) PD("G %llu rejected reason=%d op=%d", g_stat_pass + 1, g_defer.reason, g_defer.reason_op); memset(&g_defer, 0, sizeof g_defer); return;
 q_found:
     p = qop; op_hdr qh; memcpy(&qh, p, sizeof qh); p += qh.size; int q_body = 0, q_clears = 0;   // Binding tracking continues from the main scan's state (does not go back to S at the start of P)
-    for (int guard = 0; guard < 200000; guard++) { op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8; if (h.op == OP_JUMP) { memcpy(&p, a, 8); continue; }
+    for (int guard = 0; guard < 200000; guard++) { op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8; if (h.op == OP_JUMP) { memcpy(&p, a, 8); if (!cmd_handle_ok((uint64_t)(uintptr_t)p)) break; continue; }
         // The whole Q segment (up to the next SetRenderTargets / end of list): no draw may sample P's color attachments through a view covering P's level -- after deferral P's result is still in the tile and has not landed in main memory, so sampling would read old content
         if (h.op == OP_DRAW || h.op == OP_DRAW_IDX) { if (defer_prog_hits(pg, tex, img, &g_defer.p_rt, 1, 1)) { g_defer.reason = 14; goto fail; } q_body = 1; p += h.size; continue; }
         if (q_body && (h.op == OP_SET_RT || h.op == OP_END)) break;
@@ -5517,7 +5575,7 @@ static int zskip_vis_dead(void) {
     if (!g_vis_counting) return 1;
     const uint8_t *p = g_exec_next; int ci = 0; if (!p) return 0;
     for (int guard = 0; guard < 200000; guard++) { op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
-        if (h.op == OP_JUMP) { memcpy(&p, a, 8); continue; }
+        if (h.op == OP_JUMP) { memcpy(&p, a, 8); if (!cmd_handle_ok((uint64_t)(uintptr_t)p)) return 0; continue; }
         if (h.op == OP_END) { p = defer_cont(&ci); if (!p) return 0; continue; }
         if (h.op == OP_CALL) return 0;
         if (h.op == OP_RESET_COUNTER || h.op == OP_REPORT_COUNTER) { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) return h.op == OP_RESET_COUNTER; }
@@ -6285,6 +6343,252 @@ static int lc_keeps(uint32_t op) {
     }
 }
 
+// ---------- Temporal upscaling (DM_TEMPORAL=1; profile keys temporal_upscale / temporal_context) ----------
+// Tears of the Kingdom draws its 3D view at 1600x896 and upscales it to 1920x1080 with one full-screen draw (FSR1's EASU, the profile's temporal_upscale key) before it draws the HUD.
+// With DM_TEMPORAL=1 that draw is replaced: MetalFX's temporal scaler upscales the frame's colour from it, the scene depth and motion vectors the host computes, and the result is drawn into
+// the draw's target. The game renders without a sub-pixel jitter, so the host adds one (Halton 2, 3 over 8 frames): it writes the offset into the main camera's viewProj and proj in the
+// camera block (temporal_context: vertex-stage slot, offsets of viewProj, proj and the render size; Tears of the Kingdom's gsys_context) before the frame's scene passes are encoded.
+// The camera block is taken per frame as the first one bound at that slot in a pass whose depth attachment has the block's render size (shadow cameras have other sizes).
+// Motion vectors are the camera's only: each pixel's depth reprojected with this and the last frame's unjittered viewProj (tx_mv). The game draws no velocity, so characters, foliage and
+// water that move on their own get the camera's motion. A frame with no camera block falls back to the game's own upscale; a size change or a gap of frames resets the history
+static int g_tx_on = -1, g_tx_reg, g_tx_vp, g_tx_pr, g_tx_sz; static char g_tx_key[20]; static float g_tx_jsx = 1, g_tx_jsy = 1, g_tx_mvs = 1;
+static struct { uint64_t addr, frame; double vp[16], prev[16], jvp[16]; int ok, have_prev; float jx, jy; uint32_t phase; NSUInteger w, h; } g_tx;
+static id<MTLTexture> g_tx_depth, g_tx_mv, g_tx_out; static id g_tx_scaler; static NSUInteger g_tx_dim[5];
+static id<MTLFence> g_tx_fence; static id<MTL4Compiler> g_tx_compiler; static id<MTLComputePipelineState> g_tx_mv_ps; static id<MTL4ArgumentTable> g_tx_at;
+static id<MTLLibrary> g_tx_lib; static id<MTLRenderPipelineState> g_tx_cp_ps; static MTLPixelFormat g_tx_cp_fmt; static id<MTLSamplerState> g_tx_samp;
+static uint64_t g_tx_runs, g_tx_falls; static float g_tx_sharpen = 0.5f;
+static float g_tx_react; static id<MTLComputePipelineState> g_tx_react_ps; static id<MTLTexture> g_tx_rmask; static id<MTL4ArgumentTable> g_tx_at3;   // DM_TEMPORAL_REACTIVE=<gain> (tx_react; 8 by default, 0 = off)   // DM_TEMPORAL_SHARPEN=0..1 (tx_fs)
+static int g_tx_chk; static id<MTLComputePipelineState> g_tx_chk_ps; static id<MTLTexture> g_tx_hist; static id<MTLBuffer> g_tx_err; static id<MTL4ArgumentTable> g_tx_at2;   // DM_TEMPORAL_MVCHECK=1 (tx_mvchk)
+static _Atomic int g_tx_user_off;   // the Mac window's T key (front_mac.m): the game's own upscale and no jitter while set, for comparing the two live
+void mtl_temporal_toggle(void) { if (g_tx_on <= 0) { MLOG("temporal upscaling toggle: off for this run (set DM_TEMPORAL=1)"); return; }
+    int off = !atomic_load(&g_tx_user_off); atomic_store(&g_tx_user_off, off); MLOG("temporal upscaling toggle: %s", off ? "the game's own upscale (FSR1)" : "MetalFX temporal"); }
+// DM_TEMPORAL_AB=<frames>[:flip] (for comparisons in one run): every other span of that many frames runs the game's own upscale (no jitter) or, with :flip, the temporal path with the jitter signs reversed
+static int g_tx_ab, g_tx_ab_flip; static float g_tx_jtest;   // DM_TEMPORAL_JTEST=<pixels>: a fixed jitter of that size in x and y on the other span, and the game's own upscale always (checks that the jitter reaches the picture)
+static int tx_ab_phase(uint64_t fr) { return g_tx_ab > 0 ? (int)((fr / (uint64_t)g_tx_ab) & 1) : 0; }
+static const char *k_tx_msl =
+    "#include <metal_stdlib>\nusing namespace metal;\n"
+    "struct TxC { float4x4 rp, rc; float2 size; float mvs, pad; };\n"
+    // NDC from the pixel and its depth (GL depth: z = 2d - 1; NDC y up, rows down: a jitter of +y moved the picture up), reprojected to the last frame (rp) and to this frame without jitter (rc)
+    "kernel void tx_mv(depth2d<float, access::read> d [[texture(0)]], texture2d<float, access::write> mv [[texture(1)]], constant TxC& c [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
+    "  if (g.x >= uint(c.size.x) || g.y >= uint(c.size.y)) return;\n"
+    "  float2 uv = (float2(g) + 0.5) / c.size; float4 n = float4(uv.x * 2 - 1, 1 - uv.y * 2, d.read(g) * 2 - 1, 1);\n"
+    "  float4 p = c.rp * n, q = c.rc * n;\n"
+    "  mv.write(float4((p.xy / p.w - q.xy / q.w) * float2(0.5, -0.5) * c.size * c.mvs, 0, 0), g); }\n"
+    // DM_TEMPORAL_MVCHECK: last frame's input colour fetched where each variant of the motion vector points, against this frame's colour (every 4th pixel each way; error × 256 per variant,
+    // then the pixel count): 0 no motion, 1 GL depth (2d − 1) toward the last frame, 2 GL depth away from it, 3 depth as is (0..1) toward, 4 depth as is away
+    "kernel void tx_mvchk(depth2d<float, access::read> d [[texture(0)]], texture2d<float> cur [[texture(1)]], texture2d<float> prev [[texture(2)]], constant TxC& c [[buffer(0)]], device atomic_uint *e [[buffer(1)]], uint2 g4 [[thread_position_in_grid]]) {\n"
+    "  uint2 g = g4 * 4; if (g.x >= uint(c.size.x) || g.y >= uint(c.size.y)) return;\n"
+    "  constexpr sampler s(coord::pixel, filter::linear, address::clamp_to_edge);\n"
+    "  float2 uv = (float2(g) + 0.5) / c.size; float z = d.read(g); float3 cc = cur.read(g).rgb; float l0 = dot(cc, float3(0.3, 0.6, 0.1));\n"
+    "  for (int v = 0; v < 5; v++) { float2 mv = 0;\n"
+    "    if (v) { float4 n = float4(uv.x * 2 - 1, 1 - uv.y * 2, v < 3 ? z * 2 - 1 : z, 1); float4 p = c.rp * n, q = c.rc * n; mv = (p.xy / p.w - q.xy / q.w) * float2(0.5, -0.5) * c.size; if (v == 2 || v == 4) mv = -mv; }\n"
+    "    float l1 = dot(prev.sample(s, float2(g) + 0.5 + mv).rgb, float3(0.3, 0.6, 0.1));\n"
+    "    atomic_fetch_add_explicit(&e[v], uint(min(abs(l1 - l0), 4.0) * 256), memory_order_relaxed); }\n"
+    "  atomic_fetch_add_explicit(&e[7], 1u, memory_order_relaxed); }\n"
+    // Reactive mask (DM_TEMPORAL_REACTIVE): where this frame's colour falls outside last frame's 3x3 neighbourhood at the reprojected position, the history is not to be trusted
+    // (leaves in the wind, characters, water: anything moving on its own, which the camera's motion vectors miss); 0 = history as usual, 1 = this frame only
+    "kernel void tx_react(depth2d<float, access::read> d [[texture(0)]], texture2d<float> cur [[texture(1)]], texture2d<float> prev [[texture(2)]], texture2d<float, access::write> rm [[texture(3)]], constant TxC& c [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
+    "  if (g.x >= uint(c.size.x) || g.y >= uint(c.size.y)) return;\n"
+    "  constexpr sampler s(coord::pixel, filter::linear, address::clamp_to_edge);\n"
+    "  float2 uv = (float2(g) + 0.5) / c.size; float4 n = float4(uv.x * 2 - 1, 1 - uv.y * 2, d.read(g) * 2 - 1, 1);\n"
+    "  float4 p = c.rp * n, q = c.rc * n; float2 mv = (p.xy / p.w - q.xy / q.w) * float2(0.5, -0.5) * c.size; float2 at = float2(g) + 0.5 + mv;\n"
+    "  float l = dot(cur.read(g).rgb, float3(0.3, 0.6, 0.1)), mn = 1e9, mx = -1e9;\n"
+    "  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) { float v = dot(prev.sample(s, at + float2(x, y)).rgb, float3(0.3, 0.6, 0.1)); mn = min(mn, v); mx = max(mx, v); }\n"
+    "  float out = any(at < 0) || at.x > c.size.x || at.y > c.size.y ? 1 : saturate(max(max(mn - l, l - mx), 0.0) * c.pad);\n"
+    "  rm.write(float4(out), g); }\n"
+    "struct V { float4 p [[position]]; float2 uv; };\n"
+    "vertex V tx_vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
+    // the copy into the game's target, with contrast-adaptive sharpening (AMD CAS's weights; sh 0 = a plain copy): MetalFX's output is softer than the game's FSR1 in motion
+    "fragment float4 tx_fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant float& sh [[buffer(0)]]) {\n"
+    "  int2 p = int2(in.p.xy), m = int2(t.get_width() - 1, t.get_height() - 1); float4 c4 = t.read(uint2(p));\n"
+    "  if (sh <= 0) return c4;\n"
+    "  float3 c = c4.rgb, n = t.read(uint2(clamp(p + int2(0, -1), 0, m))).rgb, so = t.read(uint2(clamp(p + int2(0, 1), 0, m))).rgb, e = t.read(uint2(clamp(p + int2(1, 0), 0, m))).rgb, w = t.read(uint2(clamp(p + int2(-1, 0), 0, m))).rgb;\n"
+    "  float3 mn = min(c, min(min(n, so), min(e, w))), mx = max(c, max(max(n, so), max(e, w)));\n"
+    "  float3 amp = sqrt(saturate(min(mn, 1 - mx) / max(mx, 1e-4))); float3 wg = amp * (-1.0 / mix(8.0, 5.0, sh));\n"
+    "  return float4(max((c + (n + so + e + w) * wg) / (1 + 4 * wg), 0), c4.a); }\n";
+static int tx_on(void) {
+    if (g_tx_on >= 0) return g_tx_on;
+    g_tx_on = 0; const char *e = getenv("DM_TEMPORAL");
+    if (!e || !atoi(e)) return 0;
+    if (!*DM_GAME_TEMPORAL_FS || sscanf(DM_GAME_TEMPORAL_CTX, "%i %i %i %i", &g_tx_reg, &g_tx_vp, &g_tx_pr, &g_tx_sz) != 4 || g_tx_reg < 0 || g_tx_reg >= 16) { MLOG("[RED] DM_TEMPORAL=1: this game's profile has no temporal_upscale / temporal_context; temporal upscaling stays off"); return 0; }
+    if (![MTLFXTemporalScalerDescriptor supportsDevice:g_dev] || ![MTLFXTemporalScalerDescriptor supportsMetal4FX:g_dev]) { MLOG("[RED] DM_TEMPORAL=1: %s has no MetalFX temporal scaler; temporal upscaling stays off", g_dev.name.UTF8String); return 0; }
+    NSError *er = nil; g_tx_lib = [g_dev newLibraryWithSource:@(k_tx_msl) options:nil error:&er];
+    id<MTLFunction> f = g_tx_lib ? [g_tx_lib newFunctionWithName:@"tx_mv"] : nil;
+    g_tx_mv_ps = f ? [g_dev newComputePipelineStateWithFunction:f error:&er] : nil;
+    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 2; ad.maxBufferBindCount = 1; ad.maxSamplerStateBindCount = 1;
+    g_tx_at = g_tx_mv_ps ? [g_dev newArgumentTableWithDescriptor:ad error:&er] : nil;
+    g_tx_compiler = g_tx_at ? [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&er] : nil;
+    if (!g_tx_compiler) { MLOG("[RED] DM_TEMPORAL=1: cannot set up the motion-vector kernel or the MetalFX compiler: %s", er.localizedDescription.UTF8String); return 0; }
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; sd.supportArgumentBuffers = YES; g_tx_samp = [g_dev newSamplerStateWithDescriptor:sd];
+    g_tx_fence = [g_dev newFence];
+    if (getenv("DM_TEMPORAL_MVCHECK") && atoi(getenv("DM_TEMPORAL_MVCHECK"))) {
+        id<MTLFunction> cf = [g_tx_lib newFunctionWithName:@"tx_mvchk"]; g_tx_chk_ps = cf ? [g_dev newComputePipelineStateWithFunction:cf error:&er] : nil;
+        MTL4ArgumentTableDescriptor *ad2 = [MTL4ArgumentTableDescriptor new]; ad2.maxTextureBindCount = 3; ad2.maxBufferBindCount = 2; g_tx_at2 = g_tx_chk_ps ? [g_dev newArgumentTableWithDescriptor:ad2 error:&er] : nil;
+        g_tx_err = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; memset(g_tx_err.contents, 0, 64); res_add(g_tx_err);
+        g_tx_chk = g_tx_at2 != nil; MLOG("DM_TEMPORAL_MVCHECK: %s", g_tx_chk ? "motion-vector check on (every 120 upscaled frames)" : "could not set up the check kernel"); }
+    snprintf(g_tx_key, sizeof g_tx_key, "%s", DM_GAME_TEMPORAL_FS);
+    // DM_TEMPORAL_SIGNS=jx,jy,mv (each 1 or -1): the conventions of the jitter offset handed to MetalFX and of the motion vectors, for checking them
+    const char *rea = getenv("DM_TEMPORAL_REACTIVE"); g_tx_react = rea ? fmaxf((float)atof(rea), 0) : 8;   // 8: picked by playing, the T key against FSR1 (leaves and Link smeared less)
+    if (g_tx_react > 0) { id<MTLFunction> rf = [g_tx_lib newFunctionWithName:@"tx_react"]; g_tx_react_ps = rf ? [g_dev newComputePipelineStateWithFunction:rf error:&er] : nil;
+        MTL4ArgumentTableDescriptor *ad3 = [MTL4ArgumentTableDescriptor new]; ad3.maxTextureBindCount = 4; ad3.maxBufferBindCount = 1; g_tx_at3 = g_tx_react_ps ? [g_dev newArgumentTableWithDescriptor:ad3 error:&er] : nil;
+        if (!g_tx_at3) { MLOG("[RED] DM_TEMPORAL_REACTIVE: cannot set up the reactive-mask kernel: %s", er.localizedDescription.UTF8String); g_tx_react = 0; } }
+    const char *shp = getenv("DM_TEMPORAL_SHARPEN"); if (shp) g_tx_sharpen = fminf(fmaxf((float)atof(shp), 0), 1);
+    const char *sg = getenv("DM_TEMPORAL_SIGNS"); if (sg) sscanf(sg, "%f,%f,%f", &g_tx_jsx, &g_tx_jsy, &g_tx_mvs);
+    const char *ab = getenv("DM_TEMPORAL_AB"); if (ab) { g_tx_ab = atoi(ab); g_tx_ab_flip = strstr(ab, ":flip") != NULL;
+        const char *jt = getenv("DM_TEMPORAL_JTEST"); if (jt) g_tx_jtest = (float)atof(jt);
+        if (g_tx_ab > 0) MLOG("DM_TEMPORAL_AB: every other %d frames %s (comparison)", g_tx_ab, g_tx_ab_flip ? "with the jitter signs reversed" : "with the game's own upscale"); }
+    MLOG("temporal upscaling: on (MetalFX temporal scaler in place of fragment shader %s; camera block at vertex slot %d, viewProj +%#x, proj +%#x, size +%#x; signs %g,%g,%g; sharpening %.2f, reactive gain %.1f)", g_tx_key, g_tx_reg, g_tx_vp, g_tx_pr, g_tx_sz, g_tx_jsx, g_tx_jsy, g_tx_mvs, g_tx_sharpen, g_tx_react);
+    return g_tx_on = 1;
+}
+static float tx_halton(uint32_t i, uint32_t b) { float f = 1, r = 0; while (i) { f /= b; r += f * (i % b); i /= b; } return r; }
+static int tx_inv4(const double m[16], double o[16]) {   // row-major 4x4 inverse (Gauss-Jordan, partial pivoting)
+    double a[4][8]; for (int i = 0; i < 4; i++) for (int j = 0; j < 8; j++) a[i][j] = j < 4 ? m[i * 4 + j] : (j - 4 == i);
+    for (int c = 0; c < 4; c++) {
+        int p = c; for (int r = c + 1; r < 4; r++) if (fabs(a[r][c]) > fabs(a[p][c])) p = r;
+        if (fabs(a[p][c]) < 1e-30) return 0;
+        if (p != c) for (int j = 0; j < 8; j++) { double t = a[c][j]; a[c][j] = a[p][j]; a[p][j] = t; }
+        double d = a[c][c]; for (int j = 0; j < 8; j++) a[c][j] /= d;
+        for (int r = 0; r < 4; r++) if (r != c) { double f = a[r][c]; for (int j = 0; j < 8; j++) a[r][j] -= f * a[c][j]; }
+    }
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) o[i * 4 + j] = a[i][j + 4];
+    return 1;
+}
+static void tx_mul_cm(const double a[16], const double b[16], float out_cm[16]) {   // a · b (row-major) stored column-major for Metal's float4x4
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { double s = 0; for (int k = 0; k < 4; k++) s += a[i * 4 + k] * b[k * 4 + j]; out_cm[j * 4 + i] = (float)s; }
+}
+// Called by draw() before its pass begins: the first camera block of the frame bound at the profile's slot in a pass whose depth attachment has the block's render size gets this frame's jitter
+static void tx_sniff(void) {
+    if (!R.has_rt || !R.rt.depth) return;
+    uint64_t fr = atomic_load(&g_cur_frame);
+    if (g_tx.ok && g_tx.frame == fr) return;
+    if ((tx_ab_phase(fr) && !g_tx_ab_flip && g_tx_jtest == 0) || atomic_load(&g_tx_user_off)) return;   // the game's own upscale this span (DM_TEMPORAL_AB, the T key)
+    const p_bind_buf *u = &S.ubo[0][g_tx_reg];
+    if (!u->addr || u->size < (uint64_t)g_tx_sz + 8 || u->size < (uint64_t)g_tx_vp + 64 || u->size < (uint64_t)g_tx_pr + 64) return;
+    float *c = (float *)u->addr;
+    uint64_t s_; int lv, sl; rt_sub(&R.rt, 8, &s_, &lv, &sl);
+    NSUInteger w = (NSUInteger)c[g_tx_sz / 4], h = (NSUInteger)c[g_tx_sz / 4 + 1];
+    if (!w || !h || w != MAX(R.rt.depth->d.width >> lv, 1u) || h != MAX(R.rt.depth->d.height >> lv, 1u)) return;
+    id<MTLTexture> dt = tex_mtl(R.rt.depth);
+    if (!dt || (dt.pixelFormat != MTLPixelFormatDepth32Float && dt.pixelFormat != MTLPixelFormatDepth32Float_Stencil8)) return;
+    int cont = g_tx.ok && fr > g_tx.frame && fr - g_tx.frame <= 2 && g_tx.w == w && g_tx.h == h;
+    if (g_tx.ok) memcpy(g_tx.prev, g_tx.vp, sizeof g_tx.vp);
+    for (int i = 0; i < 16; i++) g_tx.vp[i] = c[g_tx_vp / 4 + i];
+    g_tx.phase = g_tx.phase % 8 + 1; g_tx.jx = tx_halton(g_tx.phase, 2) - 0.5f; g_tx.jy = tx_halton(g_tx.phase, 3) - 0.5f;
+    if (g_tx_jtest != 0) g_tx.jx = g_tx.jy = tx_ab_phase(fr) ? g_tx_jtest : 0;
+    float ox = 2 * g_tx.jx / w, oy = 2 * g_tx.jy / h;   // NDC: the picture moves by jx pixels right and jy pixels up (NDC y points up, rows down; DM_TEMPORAL_JTEST)
+    memcpy(g_tx.jvp, g_tx.vp, sizeof g_tx.vp);
+    for (int j = 0; j < 4; j++) { g_tx.jvp[j] += ox * g_tx.vp[12 + j]; g_tx.jvp[4 + j] += oy * g_tx.vp[12 + j]; }
+    int offs[2] = {g_tx_vp, g_tx_pr};
+    for (int k = 0; k < 2; k++) { float *m = c + offs[k] / 4; for (int j = 0; j < 4; j++) { m[j] += ox * m[12 + j]; m[4 + j] += oy * m[12 + j]; } }
+    g_tx.addr = u->addr; g_tx.frame = fr; g_tx.ok = 1; g_tx.have_prev = cont; g_tx.w = w; g_tx.h = h; g_tx_depth = dt;
+    PD("M %llu temporal upscaling: camera block %#llx (%lux%lu), jitter %.3f,%.3f%s", g_stat_pass + 1, (unsigned long long)u->addr, (unsigned long)w, (unsigned long)h, g_tx.jx, g_tx.jy, cont ? "" : " (history reset)");
+}
+static id<MTLRenderPipelineState> tx_copy_pso(MTLPixelFormat f) {
+    if (g_tx_cp_ps && g_tx_cp_fmt == f) return g_tx_cp_ps;
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = [g_tx_lib newFunctionWithName:@"tx_vs"]; pd.fragmentFunction = [g_tx_lib newFunctionWithName:@"tx_fs"];
+    pd.colorAttachments[0].pixelFormat = f; NSError *e = nil;
+    g_tx_cp_ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e]; g_tx_cp_fmt = f;
+    if (!g_tx_cp_ps) MLOG("[RED] temporal upscaling: no copy pipeline for format %lu: %s", (unsigned long)f, e.localizedDescription.UTF8String);
+    return g_tx_cp_ps;
+}
+// Called by draw() for the profile's upscale draw: 1 = done here (the draw is not encoded), 0 = the game's own upscale draws
+static int tx_run(NvProg *pr) {
+    uint64_t fr = atomic_load(&g_cur_frame);
+    if ((tx_ab_phase(fr) && !g_tx_ab_flip) || g_tx_jtest != 0 || atomic_load(&g_tx_user_off)) return 0;
+    if (!g_tx.ok || g_tx.frame != fr || !g_tx_depth || !R.has_rt || !R.rt.color[0]) { if (g_tx_falls++ < 8) MLOG("temporal upscaling: no camera block in frame %llu; the game's upscale draws", (unsigned long long)fr); return 0; }
+    NvShader *fs = pr->sh[1]; id<MTLTexture> src = nil;
+    pthread_mutex_lock(&g_rmu);
+    for (int i = 0; i < fs->rf.nb && !src; i++) { const nvn_rbind *b = &fs->rf.b[i];
+        if (b->kind != NVN_RB_TEX && b->kind != NVN_RB_TEXU) continue;
+        int tid = b->kind == NVN_RB_TEXU ? (int)(ubo_handle(1, b->reg, b->off) & 0xfffff) : b->reg < NTEX ? (int)(S.tex[1][b->reg] & 0xfffff) : 0;
+        void *tv = NULL; if (tid) tex_fast_rid(tid, &tv); src = (__bridge id<MTLTexture>)tv; }
+    pthread_mutex_unlock(&g_rmu);
+    uint64_t s_; int lv, sl; rt_sub(&R.rt, 0, &s_, &lv, &sl);
+    id<MTLTexture> dst = tex_mtl(R.rt.color[0]);
+    if (!src || !dst || lv || sl || src.textureType != MTLTextureType2D || g_tx.w > src.width || g_tx.h > src.height || g_tx_depth.width < g_tx.w || g_tx_depth.height < g_tx.h) {
+        if (g_tx_falls++ < 8) MLOG("[RED] temporal upscaling: the upscale draw's source / target do not fit (source %lux%lu, target level %d); the game's upscale draws", (unsigned long)src.width, (unsigned long)src.height, lv); return 0; }
+    NSUInteger dim[5] = {src.width, src.height, dst.width, dst.height, src.pixelFormat};
+    if (!g_tx_scaler || memcmp(dim, g_tx_dim, sizeof dim)) {   // (re)made for new sizes; the old textures go after the submissions using them
+        if (g_tx_mv) defer_obj_release(g_tx_mv); if (g_tx_out) defer_obj_release(g_tx_out); g_tx_scaler = nil; g_tx_mv = g_tx_out = nil; memset(g_tx_dim, 0, sizeof g_tx_dim);
+        MTLFXTemporalScalerDescriptor *d = [MTLFXTemporalScalerDescriptor new];
+        d.colorTextureFormat = src.pixelFormat; d.depthTextureFormat = g_tx_depth.pixelFormat; d.motionTextureFormat = MTLPixelFormatRG16Float; d.outputTextureFormat = MTLPixelFormatRGBA16Float;
+        d.inputWidth = src.width; d.inputHeight = src.height; d.outputWidth = dst.width; d.outputHeight = dst.height;
+        d.inputContentPropertiesEnabled = YES; d.inputContentMinScale = [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:g_dev]; d.inputContentMaxScale = [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:g_dev];
+        if (g_tx_react > 0) { d.reactiveMaskTextureEnabled = YES; d.reactiveMaskTextureFormat = MTLPixelFormatR8Unorm; }
+        id<MTL4FXTemporalScaler> s = [d newTemporalScalerWithDevice:g_dev compiler:g_tx_compiler];
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float width:src.width height:src.height mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate; td.usage = s.motionTextureUsage | MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+        id<MTLTexture> mv = s ? [g_dev newTextureWithDescriptor:td] : nil;
+        td.pixelFormat = MTLPixelFormatRGBA16Float; td.width = dst.width; td.height = dst.height; td.usage = s.outputTextureUsage | MTLTextureUsageShaderRead;
+        id<MTLTexture> out = s ? [g_dev newTextureWithDescriptor:td] : nil;
+        if (!s || !mv || !out) { MLOG("[RED] temporal upscaling: MetalFX temporal scaler %lux%lu (format %lu) → %lux%lu could not be made; temporal upscaling off", (unsigned long)src.width, (unsigned long)src.height, (unsigned long)src.pixelFormat, (unsigned long)dst.width, (unsigned long)dst.height); g_tx_on = 0; return 0; }
+        if (g_tx_react > 0) { td.pixelFormat = MTLPixelFormatR8Unorm; td.width = src.width; td.height = src.height; td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            if (g_tx_rmask) defer_obj_release(g_tx_rmask); g_tx_rmask = [g_dev newTextureWithDescriptor:td]; res_add(g_tx_rmask); }
+        s.fence = g_tx_fence; res_add(mv); res_add(out); res_commit();
+        g_tx_scaler = s; g_tx_mv = mv; g_tx_out = out; memcpy(g_tx_dim, dim, sizeof dim); g_tx.have_prev = 0;
+        MLOG("temporal upscaling: MetalFX temporal scaler %lux%lu (format %lu, content %lux%lu) → %lux%lu (target format %lu); content scale %.2f–%.2f", (unsigned long)src.width, (unsigned long)src.height, (unsigned long)src.pixelFormat,
+             (unsigned long)g_tx.w, (unsigned long)g_tx.h, (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat, d.inputContentMinScale, d.inputContentMaxScale);
+    }
+    id<MTLRenderPipelineState> cps = tx_copy_pso(dst.pixelFormat); if (!cps) { g_tx_on = 0; return 0; }
+    double ij[16]; if (!tx_inv4(g_tx.jvp, ij)) return 0;
+    if (g_enc) rp_end();
+    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    // 1. motion vectors at the input's resolution
+    typedef struct { float rp[16], rc[16]; float size[2], mvs, pad; } txc;
+    id<MTLBuffer> cb; size_t co = arena_alloc(sizeof(txc), &cb); txc *k = (txc *)((uint8_t *)cb.contents + co);
+    tx_mul_cm(g_tx.have_prev ? g_tx.prev : g_tx.vp, ij, k->rp); tx_mul_cm(g_tx.vp, ij, k->rc); k->size[0] = g_tx.w; k->size[1] = g_tx.h; k->mvs = g_tx_mvs; k->pad = g_tx_react;
+    id<MTL4ComputeCommandEncoder> ce = (id<MTL4ComputeCommandEncoder>)enc_c_begin(NULL);
+    [ce setArgumentTable:g_tx_at]; [ce setComputePipelineState:g_tx_mv_ps];
+    [g_tx_at setTexture:g_tx_depth.gpuResourceID atIndex:0]; [g_tx_at setTexture:g_tx_mv.gpuResourceID atIndex:1]; [g_tx_at setAddress:cb.gpuAddress + co atIndex:0];
+    [ce dispatchThreads:MTLSizeMake(g_tx.w, g_tx.h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    int hist_ok = 0;
+    if (g_tx_chk || g_tx_react > 0) {   // the check (tx_mvchk) and the reactive mask (tx_react) against last frame's input, then this frame's input kept for the next
+        if (!g_tx_hist || g_tx_hist.width != src.width || g_tx_hist.height != src.height || g_tx_hist.pixelFormat != src.pixelFormat) {
+            MTLTextureDescriptor *hd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO]; hd.storageMode = MTLStorageModePrivate; hd.usage = MTLTextureUsageShaderRead;
+            if (g_tx_hist) defer_obj_release(g_tx_hist); g_tx_hist = [g_dev newTextureWithDescriptor:hd]; res_add(g_tx_hist); res_commit(); }
+        else if (g_tx.have_prev) hist_ok = 1;
+        if (hist_ok && g_tx_react > 0) {
+            [ce setArgumentTable:g_tx_at3]; [ce setComputePipelineState:g_tx_react_ps];
+            [g_tx_at3 setTexture:g_tx_depth.gpuResourceID atIndex:0]; [g_tx_at3 setTexture:src.gpuResourceID atIndex:1]; [g_tx_at3 setTexture:g_tx_hist.gpuResourceID atIndex:2]; [g_tx_at3 setTexture:g_tx_rmask.gpuResourceID atIndex:3];
+            [g_tx_at3 setAddress:cb.gpuAddress + co atIndex:0];
+            [ce dispatchThreads:MTLSizeMake(g_tx.w, g_tx.h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; }
+        if (hist_ok && g_tx_chk) {
+            [ce setArgumentTable:g_tx_at2]; [ce setComputePipelineState:g_tx_chk_ps];
+            [g_tx_at2 setTexture:g_tx_depth.gpuResourceID atIndex:0]; [g_tx_at2 setTexture:src.gpuResourceID atIndex:1]; [g_tx_at2 setTexture:g_tx_hist.gpuResourceID atIndex:2];
+            [g_tx_at2 setAddress:cb.gpuAddress + co atIndex:0]; [g_tx_at2 setAddress:g_tx_err.gpuAddress atIndex:1];
+            [ce dispatchThreads:MTLSizeMake((g_tx.w + 3) / 4, (g_tx.h + 3) / 4, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; }
+        [ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+        [ce copyFromTexture:src toTexture:g_tx_hist];
+        uint32_t *e = g_tx_err ? g_tx_err.contents : NULL;
+        if (e && e[7] && g_tx_runs % 120 == 0) { double n = e[7] * 256.0; MLOG("motion-vector check (mean luminance error × 1000 over %u pixels): none %.2f, GL depth toward %.2f / away %.2f, 0..1 depth toward %.2f / away %.2f", e[7], e[0] / n * 1000, e[1] / n * 1000, e[2] / n * 1000, e[3] / n * 1000, e[4] / n * 1000); memset(e, 0, 64); }
+    }
+    [ce updateFence:g_tx_fence afterEncoderStages:MTLStageDispatch | MTLStageBlit];
+    enc_c_end(ce);
+    // 2. the scaler (waits for the fence, updates it when done)
+    id<MTL4FXTemporalScaler> s = g_tx_scaler;
+    s.colorTexture = src; s.depthTexture = g_tx_depth; s.motionTexture = g_tx_mv; s.outputTexture = g_tx_out;
+    s.inputContentWidth = g_tx.w; s.inputContentHeight = g_tx.h; if (g_tx_react > 0) s.reactiveMaskTexture = g_tx_rmask;   // stale on a history reset, which ignores it
+    // MetalFX takes the offset back to the frame's reference: the picture moved jx right and jy up (-jy in rows), so (-jx, +jy). Measured with DM_TEMPORAL_AB=100:flip on a still camera: this way is sharper (2.0 against 1.7 mean gradient)
+    float jf = tx_ab_phase(fr) ? -1 : 1; s.jitterOffsetX = -jf * g_tx_jsx * g_tx.jx; s.jitterOffsetY = jf * g_tx_jsy * g_tx.jy;
+    s.motionVectorScaleX = s.motionVectorScaleY = 1; s.depthReversed = NO; static int last_ph; s.reset = !g_tx.have_prev || tx_ab_phase(fr) != last_ph; last_ph = tx_ab_phase(fr);
+    [s encodeToCommandBuffer:(id<MTL4CommandBuffer>)g_cb];
+    // 3. the result drawn into the upscale draw's target
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTL4RenderCommandEncoder> re = [(id<MTL4CommandBuffer>)g_cb renderCommandEncoderWithDescriptor:rp];
+    [re barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    [re waitForFence:g_tx_fence beforeEncoderStages:MTLStageFragment];
+    [re setArgumentTable:g_tx_at atStages:MTLRenderStageFragment];
+    id<MTLBuffer> sb; size_t so = arena_alloc(16, &sb); *(float *)((uint8_t *)sb.contents + so) = g_tx_sharpen;
+    [g_tx_at setTexture:g_tx_out.gpuResourceID atIndex:0]; [g_tx_at setSamplerState:g_tx_samp.gpuResourceID atIndex:0]; [g_tx_at setAddress:sb.gpuAddress + so atIndex:0];
+    [re setViewport:(MTLViewport){0, 0, dst.width, dst.height, 0, 1}]; [re setRenderPipelineState:cps];
+    [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    m4_end(re);
+    g_tx.have_prev = 1;
+    if (++g_tx_runs == 1 || g_tx_runs % 3600 == 0) MLOG("temporal upscaling: %llu frames upscaled, %llu fell back to the game's upscale", (unsigned long long)g_tx_runs, (unsigned long long)g_tx_falls);
+    PD("M %llu temporal upscaling replaced the upscale draw (%lux%lu → %lux%lu, jitter %.3f,%.3f)", g_stat_pass, (unsigned long)g_tx.w, (unsigned long)g_tx.h, (unsigned long)dst.width, (unsigned long)dst.height, g_tx.jx, g_tx.jy);
+    return 1;
+}
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     g_draw_binst = (uint32_t)(dw ? dw->base_instance : di ? di->base_instance : 0);   // c0 + 0x644 of the stages that read the driver segment (encode_args)
     int mdx_on = (dw && dw->mdi_cnt) || (di && di->mdi_cnt) ? mdx_wanted(dw, di) : 0;   // an indirect-count multi-draw's record masked on the GPU (mdx_run), else read after a wait
@@ -6294,6 +6598,9 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
     if (S.rast_discard) { tf_draw(pr, dw, di); return; }   // the vertex stage only: transform feedback capture, or nothing (tf_draw)
+    if (g_tx_on && tx_on() && !g_defer_replaying) {   // temporal upscaling (see tx_run): the camera block, and the game's upscale draw replaced
+        tx_sniff();
+        if (pr->sh[1] && !strncmp(pr->sh[1]->key, g_tx_key, strlen(g_tx_key)) && tx_run(pr)) return; }
     if (g_nubd && g_enc && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); }   // land the deferred inline updates before this draw (see ubd_conflict)
     if (zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("zero-source skip: first case pass %llu", g_stat_pass + 1); }
@@ -6943,7 +7250,7 @@ static void clear_tex(const p_clear_tex *c) {
         MTLRenderPassAttachmentDescriptor *a = depth ? rp.depthAttachment : stencil ? rp.stencilAttachment : rp.colorAttachments[0];
         a.texture = t; a.level = lv; a.loadAction = MTLLoadActionClear; a.storeAction = MTLStoreActionStore;
         if (is3d) a.depthPlane = c->r.zoffset + z; else a.slice = l0 + c->r.zoffset + z;
-        if (depth) { rp.depthAttachment.clearDepth = c->c.f[0];
+        if (depth) { rp.depthAttachment.clearDepth = clear_depth(t.pixelFormat, c->c.f[0]);
             if (stencil) { rp.stencilAttachment.texture = t; rp.stencilAttachment.level = lv; rp.stencilAttachment.slice = a.slice; rp.stencilAttachment.loadAction = MTLLoadActionClear;
                            rp.stencilAttachment.storeAction = MTLStoreActionStore; rp.stencilAttachment.clearStencil = c->c.u[1]; } }
         else if (stencil) rp.stencilAttachment.clearStencil = c->c.u[0];
@@ -7145,8 +7452,15 @@ void mtl_exec(const uint8_t *p) {
                 }
                 return;   // An end-of-pass triggered outside a list (present / CPU readback etc.) must not scan expired command memory: a null start point means store everything
             case OP_BEGIN: break;
-            case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
+            case OP_JUMP: { uint64_t t; memcpy(&t, a, 8);
+                if (!cmd_handle_ok(t)) {   // the JUMP at the end of a segment was overwritten (the game reused command memory a cached handle still runs through): end this list here instead of reading the address
+                    static int nbad; if (nbad++ < 24) { uint64_t w[6]; memcpy(w, p - (p >= (const uint8_t *)32 ? 16 : 0), sizeof w);
+                        MLOG("[RED] replay: JUMP target %#llx is not a command handle; the list ends here (JUMP at %p, pass %llu, frame %llu; words around it: %#llx %#llx [%#llx %#llx] %#llx %#llx)", (unsigned long long)t, p, g_stat_pass, (unsigned long long)atomic_load(&g_cur_frame),
+                             (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3], (unsigned long long)w[4], (unsigned long long)w[5]); }
+                    return; }
+                p = (const uint8_t *)t; continue; }
             case OP_CALL: { uint64_t t; memcpy(&t, a, 8);
+                if (!cmd_handle_ok(t)) { static int nbad; if (nbad++ < 24) MLOG("[RED] replay: CALL target %#llx is not a command handle; skipped (cmd=%p pass %llu frame %llu)", (unsigned long long)t, p, g_stat_pass, (unsigned long long)atomic_load(&g_cur_frame)); break; }
                 if (g_ret_n < 16) g_ret[g_ret_n] = p + h.size; g_ret_n++;   // Return stack for lookahead: after a sub-list ends, continue looking at the caller
                 mtl_exec((const uint8_t *)t); g_ret_n--; break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
@@ -7553,6 +7867,59 @@ static void present_pipeline(MTLPixelFormat format) {
         g_blit_samp = [g_dev newSamplerStateWithDescriptor:sd];
     }
 }
+// Present upscaling (DM_PRESENT_SCALER): the game's frame comes at its own size (TotK docked 1920x1080 at most; iPhone builds 1952x900) and the window or screen is usually larger (a 1280x720-point window on a Retina Mac is
+// 2560x1440 pixels, an iPhone 16:9 area about 2346x1320). linear samples it bilinearly in the present pass; metalfx (the default) upscales it first with MetalFX's spatial scaler (edge-adaptive upscaling and sharpening of one frame).
+// The spatial scaler needs no depth, motion vectors or history, which the games do not hand over (MetalFX's temporal scaler and frame interpolator need all three), so it holds for every game, NVN or Vulkan.
+// Steps: (1) the present shader copies the valid rectangle (crop, raw sRGB bytes, lower-left flip) into a cw x ch texture in the drawable's format, (2) the scaler writes the viewport-sized result, (3) the present pass draws that 1:1.
+// Only when the viewport is larger than the source both ways (a smaller window keeps the bilinear downscale); MetalFX missing or failing falls back to linear for good
+typedef struct { id scaler; id<MTLTexture> in, out; NSUInteger iw, ih, ow, oh; MTLPixelFormat pf; } fx_t;
+static fx_t g_fx4, g_fx1;   // the live present (Metal 4 command buffer) and the screenshot paths (classic command buffer, present_encode)
+static id<MTLFence> g_fx_fence; static id<MTL4Compiler> g_fx_compiler; static int g_fx_broken, g_fx_used;   // g_fx_used: the last live present went through MetalFX (present thread)
+static int fx_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DM_PRESENT_SCALER");
+        mode = !e || strcmp(e, "linear");
+        if (e && mode && strcmp(e, "metalfx")) MLOG("[RED] DM_PRESENT_SCALER=%s is neither linear nor metalfx; using metalfx", e);
+        if (mode && !([MTLFXSpatialScalerDescriptor supportsDevice:g_dev] && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("[RED] present scaler: %s has no MetalFX spatial scaler; using linear", g_dev.name.UTF8String); mode = 0; }
+        MLOG("present scaler: %s", mode ? "MetalFX spatial" : "linear");
+    }
+    return mode && !g_fx_broken;
+}
+static int fx_ready(fx_t *f, int m4, NSUInteger iw, NSUInteger ih, NSUInteger ow, NSUInteger oh, MTLPixelFormat pf) {
+    if (f->scaler && f->iw == iw && f->ih == ih && f->ow == ow && f->oh == oh && f->pf == pf) return 1;
+    if (f->scaler && m4) {   // a new size (window resized): presents in flight may still read the old textures, which Metal 4 does not retain
+        pthread_mutex_lock(&g_pq_mu); while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu); pthread_mutex_unlock(&g_pq_mu);
+        res_remove(f->in); res_remove(f->out);
+    }
+    f->scaler = nil; f->in = f->out = nil;
+    MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
+    d.colorTextureFormat = d.outputTextureFormat = pf; d.inputWidth = iw; d.inputHeight = ih; d.outputWidth = ow; d.outputHeight = oh;
+    d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;   // the swapchain's bytes are sRGB-encoded and read raw (present_raw_src)
+    id<MTLFXSpatialScalerBase> s = nil;
+    if (m4) {
+        if (!g_fx_compiler) { NSError *e = nil; g_fx_compiler = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&e];
+            if (!g_fx_compiler) MLOG("[RED] present scaler: no Metal 4 compiler for MetalFX: %s", e.localizedDescription.UTF8String); }
+        if (g_fx_compiler) s = [d newSpatialScalerWithDevice:g_dev compiler:g_fx_compiler];
+    } else s = [d newSpatialScalerWithDevice:g_dev];
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:iw height:ih mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate; td.usage = s.colorTextureUsage | MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> in = s ? [g_dev newTextureWithDescriptor:td] : nil;
+    td.width = ow; td.height = oh; td.usage = s.outputTextureUsage | MTLTextureUsageShaderRead;
+    id<MTLTexture> out = s ? [g_dev newTextureWithDescriptor:td] : nil;
+    if (!s || !in || !out) { MLOG("[RED] present scaler: MetalFX spatial scaler %lux%lu → %lux%lu (format %lu) could not be made; using linear", (unsigned long)iw, (unsigned long)ih, (unsigned long)ow, (unsigned long)oh, (unsigned long)pf); g_fx_broken = 1; return 0; }
+    s.colorTexture = in; s.outputTexture = out; s.inputContentWidth = iw; s.inputContentHeight = ih;
+    if (m4) { if (!g_fx_fence) g_fx_fence = [g_dev newFence]; s.fence = g_fx_fence; res_add(in); res_add(out); res_commit(); }
+    f->scaler = s; f->in = in; f->out = out; f->iw = iw; f->ih = ih; f->ow = ow; f->oh = oh; f->pf = pf;
+    MLOG("present scaler: MetalFX spatial %lux%lu → %lux%lu (format %lu)%s", (unsigned long)iw, (unsigned long)ih, (unsigned long)ow, (unsigned long)oh, (unsigned long)pf, m4 ? "" : " for screenshots");
+    return 1;
+}
+// The sampling rectangle of the present shader (Crop: origin and size in UV, then the clamp edges at the texel centers of the valid area)
+static void present_uv(float uv[8], id<MTLTexture> t, NSUInteger cx, NSUInteger cy, NSUInteger cw, NSUInteger ch, int flip) {
+    uv[0] = (float)cx / t.width; uv[1] = (float)cy / t.height; uv[2] = (float)cw / t.width; uv[3] = (float)ch / t.height;
+    uv[4] = (cx + 0.5f) / t.width; uv[5] = (cy + 0.5f) / t.height; uv[6] = (cx + cw - 0.5f) / t.width; uv[7] = (cy + ch - 0.5f) / t.height;
+    if (flip) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
+}
 // Present samples only the valid source rectangle declared by NVN; kept separate from the raw swapchain readback screenshot. Edges are clamped to the texel centers of the valid area, so bilinear does not read the black texels outside.
 // Present samples the raw bytes stored in the swapchain texture (the Switch's scan-out sends the stored bytes as they are): an sRGB source is replaced by a non-sRGB view of the same storage,
 // otherwise sampling decodes to linear first, the BGRA8Unorm layer does not encode again, and the whole picture comes out dark. Other formats are returned as they are (Mario's swapchain is RGBA8 and does not come here).
@@ -7593,15 +7960,25 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     static double last_vp[4];   // Log one line when the viewport changes (used by the real-device screen-level acceptance screen_check.py to check the aspect ratio)
     if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
         MLOG("present viewport %.0f,%.0f %.0fx%.0f / canvas %.0fx%.0f (game image %lux%lu)", vp.originX, vp.originY, vp.width, vp.height, dw, dh, (unsigned long)src.width, (unsigned long)src.height); }
+    id<MTLTexture> from = present_raw_src(src); int flip = atomic_load_explicit(&g_origin_ll, memory_order_relaxed); float uv[8];
+    if (fx_mode() && vp.width > cw && vp.height > ch && fx_ready(&g_fx1, 0, cw, ch, (NSUInteger)vp.width, (NSUInteger)vp.height, dst.pixelFormat)) {   // MetalFX (see fx_t): copy the valid rectangle, upscale it, draw that 1:1
+        MTLRenderPassDescriptor *cp = [MTLRenderPassDescriptor renderPassDescriptor];
+        cp.colorAttachments[0].texture = g_fx1.in; cp.colorAttachments[0].loadAction = MTLLoadActionDontCare; cp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> ce = [cb renderCommandEncoderWithDescriptor:cp];
+        [ce setViewport:(MTLViewport){0, 0, cw, ch, 0, 1}];
+        [ce setRenderPipelineState:g_blit_pso]; [ce setFragmentTexture:from atIndex:0]; [ce setFragmentSamplerState:g_blit_samp atIndex:0];
+        present_uv(uv, from, cx, cy, cw, ch, flip); [ce setFragmentBytes:uv length:sizeof uv atIndex:0];
+        [ce drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [ce endEncoding];
+        [(id<MTLFXSpatialScaler>)g_fx1.scaler encodeToCommandBuffer:cb];
+        from = g_fx1.out; cx = cy = 0; cw = from.width; ch = from.height; flip = 0;
+    }
     rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
     [en setViewport:vp];
-    [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
-    float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
-                   (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
-    if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
+    [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:from atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
+    present_uv(uv, from, cx, cy, cw, ch, flip);
     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [en endEncoding];
@@ -7621,6 +7998,27 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
     if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
+    id<MTLTexture> from = present_raw_src(src); int flip = atomic_load_explicit(&g_origin_ll, memory_order_relaxed), fx = 0;
+    if (fx_mode() && vp.width > cw && vp.height > ch && fx_ready(&g_fx4, 1, cw, ch, (NSUInteger)vp.width, (NSUInteger)vp.height, dst.pixelFormat)) {   // MetalFX (see fx_t)
+        MTL4RenderPassDescriptor *cp = [MTL4RenderPassDescriptor new];
+        cp.colorAttachments[0].texture = g_fx4.in; cp.colorAttachments[0].loadAction = MTLLoadActionDontCare; cp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTL4RenderCommandEncoder> ce = [cb renderCommandEncoderWithDescriptor:cp];
+        if (!ce) { MLOG("[RED] failed to create the M4 present copy encoder"); return 0; }
+        [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];   // the game's rendering of the frame
+        [ce setArgumentTable:g_present_args atStages:MTLRenderStageFragment];
+        [g_present_args setTexture:from.gpuResourceID atIndex:0];
+        [g_present_args setSamplerState:g_blit_samp.gpuResourceID atIndex:0];
+        present_uv((float *)g_present_uv[uv_i].contents + 8, from, cx, cy, cw, ch, flip);
+        [g_present_args setAddress:g_present_uv[uv_i].gpuAddress + 8 * sizeof(float) atIndex:0];
+        [ce setViewport:(MTLViewport){0, 0, cw, ch, 0, 1}]; [ce setRenderPipelineState:g_blit_pso];
+        [ce drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [ce updateFence:g_fx_fence afterEncoderStages:MTLStageFragment];   // the scaler waits for it and updates it in turn; the present pass waits for that
+        [ce barrierAfterStages:MTLStageFragment beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+        [ce endEncoding];
+        [(id<MTL4FXSpatialScaler>)g_fx4.scaler encodeToCommandBuffer:cb];
+        from = g_fx4.out; cx = cy = 0; cw = from.width; ch = from.height; flip = 0; fx = 1;
+    }
+    g_fx_used = fx;
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = dst;
     rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
@@ -7629,13 +8027,11 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
     if (!en) { MLOG("[RED] failed to create the M4 present render encoder"); return 0; }
     [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    if (fx) [en waitForFence:g_fx_fence beforeEncoderStages:MTLStageFragment];
     [en setArgumentTable:g_present_args atStages:MTLRenderStageFragment];
-    [g_present_args setTexture:present_raw_src(src).gpuResourceID atIndex:0];
+    [g_present_args setTexture:from.gpuResourceID atIndex:0];
     [g_present_args setSamplerState:g_blit_samp.gpuResourceID atIndex:0];
-    float *uv = g_present_uv[uv_i].contents;
-    uv[0] = (float)cx / src.width; uv[1] = (float)cy / src.height; uv[2] = (float)cw / src.width; uv[3] = (float)ch / src.height;
-    uv[4] = (cx + 0.5f) / src.width; uv[5] = (cy + 0.5f) / src.height; uv[6] = (cx + cw - 0.5f) / src.width; uv[7] = (cy + ch - 0.5f) / src.height;
-    if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
+    present_uv(g_present_uv[uv_i].contents, from, cx, cy, cw, ch, flip);
     [g_present_args setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
     [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -7715,8 +8111,14 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
     [cb endCommandBuffer];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
+    int fx = g_fx_used;
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         if (f.error) MLOG("[RED] display command buffer error: %s", f.error.description.UTF8String);
+        // GPU time of the present command buffers (feedback queue, serial): what the present scaler costs. One line every 600 presents
+        static double gsum, gmax; static unsigned gn, gfx;
+        double ms = (f.GPUEndTime - f.GPUStartTime) * 1e3;
+        if (ms >= 0 && ms < 1000) { gsum += ms; if (ms > gmax) gmax = ms; gfx += fx; if (++gn == 600) {
+            MLOG("present GPU time over 600 presents: avg %.3f ms, max %.3f ms (%u upscaled with MetalFX)", gsum / gn, gmax, gfx); gsum = gmax = 0; gn = gfx = 0; } }
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }];
     id<MTL4CommandBuffer> buffers[] = {cb};

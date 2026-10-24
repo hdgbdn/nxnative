@@ -411,10 +411,19 @@ static void read_pad(GCExtendedGamepad *g) {
     pthread_mutex_unlock(&g_mu);
     publish();
 }
+// Motion sensors of the controller (GCMotion) → the six-axis sensor (hle_hid.c dm_motion_set), as on the Mac (front_mac.m)
+static void read_motion(GCMotion *m) {
+    GCRotationRate r = m.rotationRate; double rot[3] = {r.x, r.y, r.z}, acc[3];
+    if (m.hasGravityAndUserAcceleration) { acc[0] = m.gravity.x + m.userAcceleration.x; acc[1] = m.gravity.y + m.userAcceleration.y; acc[2] = m.gravity.z + m.userAcceleration.z; }
+    else { GCAcceleration a = m.acceleration; acc[0] = a.x; acc[1] = a.y; acc[2] = a.z; }
+    dm_motion_set(rot, acc);
+}
 - (void)padsChanged {
     BOOL any = NO;
     for (GCController *c in GCController.controllers) if (c.extendedGamepad) {
         any = YES; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; read_pad(g); };
+        GCMotion *mo = c.motion;
+        if (mo && mo.hasRotationRate) { if (mo.sensorsRequireManualActivation) mo.sensorsActive = YES; mo.valueChangedHandler = ^(GCMotion *m) { read_motion(m); }; }
         read_pad(c.extendedGamepad);
     }
     if (!any) { pthread_mutex_lock(&g_mu); g_pad_btn = 0; g_pad_lx = g_pad_ly = g_pad_rx = g_pad_ry = 0; pthread_mutex_unlock(&g_mu); publish(); }

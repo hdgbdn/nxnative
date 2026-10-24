@@ -30,8 +30,8 @@ zip_store	.zs:.bwav:.mc:.webm:.metallib
 # The game also calls SetHeapSize(0x86000000) in nninitStartup (2.1 GB of the pool as its heap; a 2 GB heap region aborts there with 0xd401).
 # Measured on the Mac (title, opening cave): the alias region is used up to +1.75 GB (the SDK's ~1 GB node area, then 0.5 GB mapped); what it can map is bounded by the pool less the heap (1.1 GB).
 # So 5 GB, the total proven on a phone (one reservation of at most 6 GB without the extended virtual addressing entitlement): 256 MB in front + 2.375 GB alias region + 256 MB stack region + 2.125 GB heap region
-mem_reserve	0x140000000
-mem_alias	0x98000000
+mem_reserve	0x1C0000000
+mem_alias	0x118000000
 mem_stack	0x10000000
 app_pool	0xCD500000
 
@@ -44,6 +44,10 @@ tex_dirty_upload	on
 # 30 when 60 does not hold, game time = real time. DM_FPS_TARGET=30 (Documents/env.txt on the iPhone) saves power, 0 = the game's own step. Until the host has decided a step
 # (the first frames) the stub steps by the measured frame time
 fps_target	60
+# DM_TEMPORAL=1 (off by default): MetalFX temporal upscaling in place of the game's FSR1 pass (agl super_resolution, 1600x896 -> 1920x1080 docked, before the HUD).
+# Camera block gsys_context, bound at vertex slot 1 of the scene passes: viewProj at 0x30, proj at 0x70, render size at 0x120 (the previous frame's matrices follow at 0x150)
+temporal_upscale	ac58fc18eda5f387
+temporal_context	1 0x30 0x70 0x120
 
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/ApplicationPackage=layout /Shader/=shader /Effect/=effect /UI/=layout

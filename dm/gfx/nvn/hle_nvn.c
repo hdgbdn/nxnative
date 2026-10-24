@@ -634,8 +634,22 @@ static void cs_dump(void) {   // Called once per frame (at present)
 }
 static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, size}; memcpy(p, &h, sizeof h); if (op) cs_op(op, size); }
 // New segment: if recording is in progress, write a JUMP at the end of the old segment to link it
+#define HOSTSEG_SZ (256u << 10)   // size of one host-lent command segment (see hostseg_take)
+static uint8_t *hostseg_take(const cmd_t *o);
+// The last CMD_TAIL bytes of the command memory a game adds are never written. Real NVN writes there only when the memory runs out, which a game sizing its chunks for real-device commands never sees,
+// so games hand those bytes out again: Tears of the Kingdom adds chunks of NVN_DEVICE_INFO_COMMAND_BUFFER_MIN_COMMAND_SIZE (512 bytes) for prerecorded commands but places them 496 bytes apart.
+// Our records are larger, a recording overflowed into a host segment, and the link JUMP written at the chunk's end lay in the next chunk: its first record overwrote the JUMP's target (0x1000000003 = a CALL header),
+// and the next chunk's AddCommandMemory also reclaimed the host segment the cached handle still ran through (the replay then read garbage commands and crashed)
+#define CMD_TAIL 16
 static void cmd_new_segment(cmd_t *o, uint8_t *mem, size_t n) {
+    if (n > CMD_TAIL + 64) n -= CMD_TAIL;
     uint8_t *start = align8(mem), *end = mem + n;
+    // The memory the game hands over may begin right where the JUMP to it has to be written (Tears of the Kingdom granted a region starting 8 bytes behind the write position): the first record of the new
+    // segment would then land on the JUMP's target field, and the replay jumped to that record's header (0x1000000003 = a CALL header). Such a region is not used; the host supplies its own segment instead
+    if (o->recording && o->cur && start < o->cur + 16 && start + n > o->cur) {
+        static _Atomic int nov; if (atomic_fetch_add(&nov, 1) < 8) LOG("[nvn] the memory the game added (%p, %zu bytes) overlaps the write position %p where the JUMP to it goes; using a host-lent segment instead", (void *)mem, n, (void *)o->cur);
+        mem = hostseg_take(o); n = HOSTSEG_SZ; start = align8(mem); end = mem + n;
+    }
     if (o->recording && o->cur) { if (cs_on() && o->end > o->cur) { pthread_mutex_lock(&g_cs_mu); g_cs.waste += (uint64_t)(o->end - o->cur); pthread_mutex_unlock(&g_cs_mu); } put_hdr(o->cur, OP_JUMP, 16); memcpy(o->cur + 8, &start, 8);
         o->used += 16; }   // the JUMP also occupies guest memory of this recording: count it in used, so the game packing the next recording right behind by used does not overwrite it
     o->cur = start; o->end = end;
@@ -650,7 +664,6 @@ static void cmd_new_segment(cmd_t *o, uint8_t *mem, size_t n) {
 // (when it re-records that material in place; packing the next recording right behind by used never touches them, since used includes the JUMP). So a segment remembers that guest range and is reclaimed when the game gives out memory
 // overlapping it; segments overflowing from a host segment keep the same range.
 // The segment pool grows on demand (SMBW opening course: many small command buffers each overflow once per frame, and the old fixed 64 segments × 1 MB ran out within 8 frames); abort only beyond HOSTSEG_CAP in total.
-#define HOSTSEG_SZ (256u << 10)
 #define HOSTSEG_CAP (1u << 30)
 uint64_t dm_nvn_frame_count(void);
 typedef struct { uint8_t *mem; uint64_t frame; int busy; uintptr_t org_lo, org_hi; } hostseg_t;   // org: the guest range of the recording it hangs off (0 = unknown, never reclaimed)
@@ -729,7 +742,15 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
 NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
-    for (int i = 0; i < n; i++) { uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8); }
+    for (int i = 0; i < n; i++) {
+        if (!cmd_handle_ok((uint64_t)h[i])) {   // not a handle we returned: record nothing for it (a CALL to it would crash the replay)
+            static _Atomic int nbad; if (atomic_fetch_add(&nbad, 1) < 24) {
+                char vals[200]; int o = 0; for (int k = 0; k < n && k < 8 && o < 170; k++) o += snprintf(vals + o, sizeof vals - o, "%s%#llx", k ? " " : "", (unsigned long long)h[k]);
+                LOG("[RED] CallCommands / CopyCommands: handle %d of %d is %#llx, not a command handle; skipped (cmd=%p frame %llu, handles: %s)", i, n, (unsigned long long)h[i], (void *)c, (unsigned long long)dm_nvn_frame_count(), vals); }
+            continue;
+        }
+        uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8);
+    }
 }
 NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
     (void)loc; (void)flags;

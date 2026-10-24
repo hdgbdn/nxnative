@@ -67,9 +67,12 @@ int dm_focus_now(void) { return atomic_load(&g_focus); }
 uint64_t dm_focus_in_since(void) { return atomic_load(&g_focus_in_ns); }   // graphics layer display link watchdog: stalls are only computed while active, counted from activation (nvn_mtl.m mtl_present_wait)
 void dm_focus_set(int st) {
     if (st < 1 || st > 3) die("dm_focus_set: invalid state %d", st);
+    static int lock = -1; if (lock < 0) { const char *e = getenv("DM_FOCUS_LOCK"); lock = e && atoi(e); if (lock) LOG("DM_FOCUS_LOCK: focus loss is not reported (scripted input reaches the game while the window is in the background)"); }
+    if (lock && st == 2) st = 1;   // DM_FOCUS_LOCK=1 (tests): games ignore input out of focus, so DM_KEYS did nothing while another window was in front
     if (st == 1) atomic_store(&g_focus_in_ns, now_ns());
     if (atomic_exchange(&g_focus, st) == st) return;
     LOG("oe focus state → %d", st);
+    if (st == 3) { void dm_cloud_flush_async(void); dm_cloud_flush_async(); }   // cloud save: going to the background, upload a save not yet pushed (cloudsave.m)
     if (focus_notifies()) mq_push(MSG_FOCUS);
 }
 static int opmode(void) { return dm_opmode(); }

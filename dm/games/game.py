@@ -105,6 +105,10 @@ def header(g):
     if pl not in ('simple', 'full'): sys.exit(f'{g.id}: pad_layout must be simple or full: {pl}')
     fbs = g.words('feedback_snap', '')   # fragment shader key prefixes whose same-pass feedback sampling gets a snapshot first (nvn_mtl.m fb_prepare); none by default
     if any(not re.fullmatch(r'[0-9a-f]{8,16}', k) for k in fbs): sys.exit(f'{g.id}: feedback_snap takes fragment shader keys (8-16 lowercase hex digits): {fbs}')
+    tup = g.get('temporal_upscale', '')   # fragment shader key of the game's own full-screen upscale draw, which DM_TEMPORAL=1 replaces with MetalFX's temporal scaler (nvn_mtl.m tx_run); none by default
+    if tup and not re.fullmatch(r'[0-9a-f]{8,16}', tup): sys.exit(f'{g.id}: temporal_upscale takes a fragment shader key (8-16 lowercase hex digits): {tup}')
+    tcx = g.words('temporal_context', '')   # the main camera's uniform block: vertex-stage slot, byte offsets of viewProj, proj and the render size (nvn_mtl.m tx_sniff)
+    if (tup or tcx) and (len(tcx) != 4 or not tup or any(not re.fullmatch(r'(0x[0-9a-fA-F]+|[0-9]+)', w) for w in tcx)): sys.exit(f'{g.id}: temporal_upscale needs temporal_context <slot> <viewProj offset> <proj offset> <size offset>, and the other way round: {tcx}')
     afr = g.words('alpha_from_red', '')   # fragment shader key prefixes that read single-channel textures mapped (R, 0, 0, 1) with alpha = red (nvn_mtl.m tex_alpha_red); none by default
     if any(not re.fullmatch(r'[0-9a-f]{8,16}', k) for k in afr): sys.exit(f'{g.id}: alpha_from_red takes fragment shader keys (8-16 lowercase hex digits): {afr}')
     rcd = g.get('render_cond', 'off')   # NVN conditional rendering evaluated at replay, timestamp reports with counter 0 (nvn_mtl.m OP_RENDER_COND): on / off
@@ -156,6 +160,8 @@ def header(g):
          f'#define DM_GAME_OPMODE {int(om == "console")}',
          f'#define DM_GAME_PERF_BOOST {int(pm == "boost")}',
          f'#define DM_GAME_FEEDBACK_SNAP {q(" ".join(fbs))}',
+         f'#define DM_GAME_TEMPORAL_FS {q(tup)}',
+         f'#define DM_GAME_TEMPORAL_CTX {q(" ".join(tcx))}',
          f'#define DM_GAME_ALPHA_FROM_RED {q(" ".join(afr))}',
          f'#define DM_GAME_TEX_FLUSH_UPLOAD {int(tfu == "on")}',
          f'#define DM_GAME_RENDER_COND {int(rcd == "on")}',

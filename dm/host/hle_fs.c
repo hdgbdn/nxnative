@@ -413,6 +413,11 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv; save data 
 }
 static _Atomic uint64_t g_save_commits;   // number of successful commits (used by the front end when going to background to wait for "the game's current save has been committed")
 uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
+// Cloud save (cloudsave.m): clone the committed save directory to dst under the lock Commit holds, so the copy is one committed version, never half of a swap (APFS clone: nearly free). 0 = done, else errno
+int dm_fs_save_snapshot(const char *commit, const char *dst) {
+    pthread_mutex_lock(&g_lock); int e = clonefile(commit, dst, 0) ? errno : 0; pthread_mutex_unlock(&g_lock);
+    return e;
+}
 // Both Commit overloads share this transaction engine. Caller holds the path
 // and mount locks; front-end failure notification is delivered after unlocking.
 static Result commit_mount_locked(int i, int *notify_error) {

@@ -102,9 +102,9 @@ static void *memstat_thread(void *p) {
     return NULL;
 }
 
-__attribute__((constructor)) static void memstat_start(void) {
-    const char *p = getenv("DM_MEMSTAT");
-    if (!p || !*p) return;
+static void memstat_start(void) {
+    static int started; const char *p = getenv("DM_MEMSTAT");
+    if (!p || !*p || started++) return;
     char *path = strdup(p);
 #if TARGET_OS_IPHONE
     if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; path = malloc(n); snprintf(path, n, "%s/Documents/%s", getenv("HOME"), p); }   // Relative name → the container's Documents (the container path is not known before launch)
@@ -144,12 +144,17 @@ static void *thrcpu_thread(void *p) {
     }
     return NULL;
 }
-__attribute__((constructor)) static void thrcpu_start(void) {
-    const char *p = getenv("DM_THRCPU");
-    if (!p || !*p) return;
+static void thrcpu_start(void) {
+    static int started; const char *p = getenv("DM_THRCPU");
+    if (!p || !*p || started++) return;
     char *spec = strdup(p);
 #if TARGET_OS_IPHONE
     if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; spec = malloc(n); snprintf(spec, n, "%s/Documents/%s", getenv("HOME"), p); }
 #endif
     pthread_t th; pthread_create(&th, NULL, thrcpu_thread, spec); pthread_detach(th);
 }
+
+// Diagnostics start at load (the Mac, or an iOS launch with a process environment) and once more after the iOS app has read Documents/env.txt, which sets the variables too late for the first call;
+// each starter runs at most once.
+void dm_diag_start(void) { memstat_start(); thrcpu_start(); }
+__attribute__((constructor)) static void diag_ctor(void) { dm_diag_start(); }

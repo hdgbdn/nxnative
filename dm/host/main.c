@@ -72,6 +72,7 @@ static void host_preload(int argc, char **argv) {
         if (setrlimit(RLIMIT_NOFILE, &rl)) LOG("open file limit %llu could not be raised", (unsigned long long)was);
     }
     crash_install();
+    { void dm_cloud_start(void); dm_cloud_start(); }   // cloud save: pull before the game mounts its save (cloudsave.m; off unless DM_CLOUD_S3_ENDPOINT is set)
     const char *race = getenv("DM_TEST_KEYRACE");
     if (race && *race) {
         g_race_want = (unsigned)strtoul(race, NULL, 10);

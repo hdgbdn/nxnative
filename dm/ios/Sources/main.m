@@ -9,6 +9,7 @@
 
 int dm_main(int argc, char **argv);   // dm/host/main.c compiled in with -Dmain=dm_main
 void dm_host_preload_start(int argc, char **argv);
+void dm_diag_start(void);   // memstat.m: DM_MEMSTAT / DM_THRCPU
 UIViewController *front_ios_root(void);
 void front_ios_focus_event(int ev);
 
@@ -64,6 +65,7 @@ static int boot_env(void) {
     NSString *aoc = [res stringByAppendingPathComponent:@"aoc"];   // add-on content: build_ipa.sh puts the RomFS extracted from the player's DLC NSPs at <App>/aoc/<index>/
     if ([fm fileExistsAtPath:aoc]) setenv("DM_AOC_DIR", aoc.fileSystemRepresentation, 0);
     chdir(doc.fileSystemRepresentation);
+    dm_diag_start();   // DM_MEMSTAT / DM_THRCPU from env.txt: their load-time starters saw no variables yet
     g_argv[0] = strdup("dmhost"); g_argv[1] = strdup(dm.fileSystemRepresentation); g_argc = 2;
     dm_host_preload_start(g_argc, g_argv);   // Module tables / relocation / takeover run early in the background, in parallel with UIKit startup
     return 1;

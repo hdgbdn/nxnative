@@ -93,6 +93,9 @@ typedef struct { uint32_t stride, divisor; } vs_st;                             
 
 // ---------- Command records: {op, size (including header, aligned to 8)} + payload ----------
 typedef struct { uint32_t op, size; } op_hdr;
+// A command handle (what EndRecording returned, what CALL / JUMP follow) is the 8-byte aligned address of recorded commands: a null, small or misaligned value, or one above the 47-bit user address space, is never one
+// (Tears of the Kingdom handed 0x1000000003 to CallCommands, two small integers read as one value, and the replay died reading it). Valid-looking but stale handles are not caught here
+static inline int cmd_handle_ok(uint64_t t) { return t >= 0x10000 && !(t & 7) && t < (1ull << 47); }
 enum {
     OP_END, OP_JUMP, OP_BEGIN, OP_CALL,                                             // OP_BEGIN is no longer recorded (hle_nvn.c BeginRecording)
     OP_SIGNAL_EVENT, OP_REPORT_COUNTER, OP_COPY_B2B, OP_UPDATE_UB,                 // CPU-visible side effects
