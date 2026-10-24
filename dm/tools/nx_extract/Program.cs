@@ -33,8 +33,8 @@ static class P {
         if (a[1] == "--aoc") return Aoc(ks, a[2], a[3]);
         var basePkg = OpenNsp(ks, a[1]); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
         Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");
-        Nca updProg = updPkg == null ? null : Pick(updPkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the update NSP");
-        Nca ctrl = Pick(updPkg ?? basePkg, NcaContentType.Control);
+        Nca updProg = updPkg == null ? null : Pick(updPkg, NcaContentType.Program, baseProg.Header.TitleId) ?? throw new Exception("no Program NCA of the base game's program in the update NSP");
+        Nca ctrl = Pick(updPkg ?? basePkg, NcaContentType.Control, baseProg.Header.TitleId);
         Console.WriteLine($"title {baseProg.Header.TitleId:x16}" + (updProg != null ? $", update {updProg.Header.TitleId:x16}" : ""));
         string outDir = a[3], cmpDir = a.Length > 4 ? a[4] : null;
         if (ctrl != null) {   // control data (NACP): display version and game name; a raw copy goes to <output dir>/control.nacp for naming the app
@@ -54,6 +54,14 @@ static class P {
             if (new FileInfo(p).Length < 0x50) continue;
             byte[] h = new byte[0x50]; using (var f = File.OpenRead(p)) f.ReadExactly(h);
             if (h[0] == 'N' && h[1] == 'S' && h[2] == 'O' && h[3] == '0') Console.WriteLine($"{Path.GetFileName(p)} build id {Convert.ToHexString(h, 0x40, 16).ToLowerInvariant()}");
+        }
+        // A program can embed all assets in its code modules (ANIMAL WELL 1.0.10).
+        // Preserve the extraction layout without asking LibHac to open an absent section.
+        if (!baseProg.SectionExists(1) && (updProg == null || !updProg.SectionExists(1))) {
+            Directory.CreateDirectory(Path.Combine(outDir, "RomFS"));
+            if (manifest) File.WriteAllText(Path.Combine(outDir, "romfs_manifest.tsv"), "# path\tbytes\tfirst 32 bytes (hex)\n");
+            Console.WriteLine("program has no data section: empty RomFS");
+            return Damaged();
         }
         IStorage romfs = updProg != null ? baseProg.OpenStorageWithPatch(updProg, NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid) : baseProg.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid);
         // the same RomFS without hash checks, for reading damaged files as they are (--allow-damaged)
@@ -109,7 +117,13 @@ static class P {
         }
         return ncas;
     }
-    static Nca Pick(List<Nca> l, NcaContentType t) { foreach (Nca n in l) if (n.Header.ContentType == t) return n; return null; }
+    // A multi-program application has a Program and a Control NCA per program index (ROMANCE OF THE THREE KINGDOMS 8 REMAKE: its update 1.1.3 adds a whole second program,
+    // title ID …0001, beside the game's patch, …0000): with no title ID the lowest one (program index 0, the game), else the NCA of that title ID
+    static Nca Pick(List<Nca> l, NcaContentType t, ulong? id = null) {
+        Nca r = null;
+        foreach (Nca n in l) if (n.Header.ContentType == t && (id == null ? r == null || n.Header.TitleId < r.Header.TitleId : n.Header.TitleId == id)) r = n;
+        return r;
+    }
 
     // Icon: the control data holds one 256x256 JPEG per language (/icon_<language>.dat). Use the English one (American, then British); if neither exists, take the first in NACP language order
     static readonly string[] IconLangs = { "AmericanEnglish", "BritishEnglish", "Japanese", "French", "German", "LatinAmericanSpanish", "Spanish", "Italian",

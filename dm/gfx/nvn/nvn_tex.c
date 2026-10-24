@@ -51,7 +51,7 @@ static void shape(const nvn_texdesc *d, unsigned *dpl, int *layered, uint32_t *w
         case 2: *dpl = 3; break;                                        // 3D
         case 4: case 6: *dpl = 2; *layered = 1; break;                  // 2D_ARRAY / MS_ARRAY
         case 8: *dpl = 2; *z = 6; *layered = 1; break;                  // CUBEMAP
-        case 9: *dpl = 2; *z = d->depth * 6; *layered = 1; break;       // CUBEMAP_ARRAY
+        case 9: *dpl = 2; *layered = 1; break;                          // CUBEMAP_ARRAY: the depth counts layer-faces, as in OpenGL (DRAGON QUEST XI S: 510 for 85 cubes)
         default: *dpl = 2; *z = 1; break;                               // 2D / MS / RECTANGLE
     }
     if (*z == 0) *z = 1;

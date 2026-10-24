@@ -94,12 +94,20 @@ HLE_FORCE("_ZN2nn2oe14ExecuteProgramEiPKvm", "launch another program of the appl
     (void)param; LOG("[RED] oe::ExecuteProgram(%d, %zu bytes of parameters): the host runs only this program; the game carries on", index, n);
 }
 HLE_FORCE("_ZN2nn2oe16DisableRecordingEv", "video recording switch; the host has no system recording", void, h_oe_DisableRec, void) {}
+// Silence the game's sound in system video captures (through am; FINAL FANTASY RESONANCE imports both): the host records nothing
+HLE_FORCE("_ZN2nn2oe13MuteRecordingEv", "mute the sound of system video recording; the host has no system recording", void, h_oe_MuteRec, void) {}
+HLE_FORCE("_ZN2nn2oe15UnmuteRecordingEv", "unmute the sound of system video recording; the host has no system recording", void, h_oe_UnmuteRec, void) {}
 HLE_FORCE("_ZN2nn2oe16EnableScreenShotEv", "screenshot switch; the host has no system screenshot", void, h_oe_EnableShot, void) {}
 HLE_FORCE("_ZN2nn2oe17DisableScreenShotEv", "screenshot switch; the host has no system screenshot", void, h_oe_DisableShot, void) {}
 // Super Mario Odyssey: HOME button blocking around its own menus, screenshot orientation, and the auto-sleep query (all through am)
 HLE_FORCE("_ZN2nn2oe23BeginBlockingHomeButtonEv", "temporarily block the HOME button (through am); the host has no HOME button", void, h_oe_BlockHome, void) {}
 HLE_FORCE("_ZN2nn2oe21EndBlockingHomeButtonEv", "restore the HOME button (through am)", void, h_oe_UnblockHome, void) {}
 HLE_FORCE("_ZN2nn2oe29SetScreenShotImageOrientationENS_5album16ImageOrientationE", "screenshot orientation (through am); the host has no system screenshot", void, h_oe_ShotOrient, int o) { (void)o; }
+// DRAGON QUEST XI S: auto-sleep disabled sections (through am). The host never sleeps the device; the query reports whether a section is open, as the applet does
+static _Atomic int g_nosleep;
+HLE_FORCE("_ZN2nn2oe29BeginAutoSleepDisabledSectionEv", "open an auto-sleep disabled section (through am); the host never auto-sleeps, counted for the query", void, h_oe_NoSleepBegin, void) { g_nosleep++; }
+HLE_FORCE("_ZN2nn2oe27EndAutoSleepDisabledSectionEv", "close an auto-sleep disabled section (through am)", void, h_oe_NoSleepEnd, void) { if (g_nosleep > 0) g_nosleep--; }
+HLE_FORCE("_ZN2nn2oe19IsAutoSleepDisabledEv", "whether an auto-sleep disabled section is open", unsigned, h_oe_NoSleepQ, void) { return g_nosleep > 0; }
 HLE_FORCE("_ZN2nn2oe37IsUserInactivityDetectionTimeExtendedEv", "whether auto screen-off on inactivity is extended; the host does not turn the screen off, reports no", unsigned, h_oe_InactivityExtQ, void) { return 0; }
 // Hyrule Warriors: Age of Calamity (SDK 9.6.0, main+0x8d1238): the copyright frame buffer, an overlay the system draws only into screenshots and recordings. The SDK hands the buffer to am as transfer memory
 // (svcCreateTransferMemory, then a null applet proxy). The host has no system capture, so it keeps nothing
@@ -115,7 +123,11 @@ HLE_FORCE("_ZN2nn2oe16GetOperationModeEv", "operation mode query; a fixed value 
 HLE_FORCE("_ZN2nn2oe18GetPerformanceModeEv", "performance mode query; same as the operation mode (profile perf_mode boost: Boost)", int, h_oe_GetPerfMode, void) { return DM_GAME_PERF_BOOST ? 1 : opmode(); }
 // SDK 11 calls of Monster Hunter Rise: the CPU overclock query reads an apm session the host never opened (null read in sdk+0x35258 at the start of nnMain, main+0x6bc8650);
 // the default display resolution is the TV's (1080p docked) or the panel's (720p handheld) and only changes with the operation mode
-HLE_FORCE("_ZN2nn2oe21IsCpuOverclockEnabledEv", "CPU overclock state (through apm): not enabled", unsigned, h_oe_CpuOc, void) { return 0; }
+// Taiko Risshiden V DX (SDK 12.3.3) turns it on in nnMain (main+0x2e1e4c): the setter goes through the same apm session (null read at sdk+0x362b8). The host does not scale clocks;
+// the query reports what was set, as apm does
+static unsigned char g_cpu_oc;
+HLE_FORCE("_ZN2nn2oe21IsCpuOverclockEnabledEv", "CPU overclock state (through apm): what SetCpuOverclockEnabled set, off at start", unsigned, h_oe_CpuOc, void) { return g_cpu_oc; }
+HLE_FORCE("_ZN2nn2oe22SetCpuOverclockEnabledEb", "CPU overclock switch (through apm); the host does not scale clocks", void, h_oe_SetCpuOc, unsigned on) { g_cpu_oc = on & 0xff; }
 HLE_FORCE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", "default display resolution: 1920x1080 docked, 1280x720 handheld", void, h_oe_DefRes, int *w, int *h) {
     int con = opmode() == 1; if (w) *w = con ? 1920 : 1280; if (h) *h = con ? 1080 : 720;
 }
@@ -206,6 +218,15 @@ HLE_FORCE("_ZN2nn2oe18GetDesiredLanguageEv", "system language query; value from 
     strncpy(code, e && *e ? e : "en-US", sizeof code - 1);
     uint64_t v; memcpy(&v, code, 8);
     return v;
+}
+
+// The console's region (Animal Crossing: New Horizons 3.0.3): the SDK asks settings::system::GetRegionCode, which reaches set:sys. A region that fits the language the game is given:
+// 0 Japan, 1 the Americas, 2 Europe, 4 Hong Kong / Taiwan / Korea (nn::settings::system::RegionCode; 3 Australia and 5 China are left out, no language points at them alone)
+HLE_FORCE("_ZN2nn2oe13GetRegionCodeEv", "console region (set:sys); from DM_LANG", int, h_oe_GetRegion, void) {
+    const char *e = getenv("DM_LANG"); if (!e || !*e) e = "en-US";
+    int r = !strncmp(e, "ja", 2) ? 0 : !strncmp(e, "ko", 2) || !strncmp(e, "zh", 2) ? 4 : !strcmp(e, "en-US") || !strcmp(e, "fr-CA") || !strcmp(e, "es-419") || !strcmp(e, "pt-BR") ? 1 : 2;
+    static int once; if (!once++) LOG("oe::GetRegionCode: %d for language %s", r, e);
+    return r;
 }
 
 // nn::util::Uuid 16 bytes: a fixed local value (only used to tell devices apart locally, networking is cut)
