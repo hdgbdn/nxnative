@@ -10,7 +10,7 @@
 // (a device that has just started a fresh game must not beat real progress). The side that loses is kept, never dropped:
 // the local save is renamed to <save>.before-sync-<time> (the newest 3 stay), a remote save about to be overwritten is first copied (S3 copy) to <prefix>/<title ID>/history/. Offline or failing: the local save is used as it is.
 // Running: the save is never replaced (the game has it mounted). A thread watches the number of save commits (dm_fs_commit_count); 8 s after the last commit the save is uploaded.
-// The upload reads a clone of the committed directory taken under hle_fs.c's commit lock (dm_fs_save_snapshot), so it is always one committed version; an empty save is never uploaded,
+// The upload reads a clone of the committed directory taken under hle_fs.c's commit locks (dm_fs_clone_committed), so it is always one committed version; an empty save is never uploaded,
 // and a remote save that has to be kept in history/ is not overwritten until the copy succeeded. A pull swaps the downloaded directory in with one renamex_np(RENAME_SWAP).
 // Writes are conditional (If-Match / If-None-Match on the ETags just read), so two devices uploading at the same moment cannot overwrite each other unseen: the loser reads again and keeps the
 // winner's save in history/ first. save.meta records the ETag of the save.bin it belongs to, so a save.bin whose save.meta is not written yet is recognised as another device's. A server that answers
@@ -30,7 +30,7 @@
 #include "hle.h"
 
 uint64_t dm_fs_commit_count(void);
-int dm_fs_save_snapshot(const char *commit, const char *dst);   // hle_fs.c
+int dm_fs_clone_committed(const char *dir, const char *to);   // hle_fs.c
 
 #define SAVE_MAX (256ull << 20)   // a save bigger than this is not synced (it is kept in memory while packed)
 
@@ -165,7 +165,7 @@ static NSData *pack_save(uint64_t *newest) {
     NSString *snap = [g_dir stringByAppendingString:@".cloud.snap"]; NSFileManager *fm = NSFileManager.defaultManager;
     [fm removeItemAtPath:snap error:nil];
     BOOL exists = [fm fileExistsAtPath:g_dir];
-    if (exists && !dm_fs_save_snapshot(g_dir.fileSystemRepresentation, snap.fileSystemRepresentation)) { NSData *a = pack_dir(snap, newest); [fm removeItemAtPath:snap error:nil]; return a; }
+    if (exists && !dm_fs_clone_committed(g_dir.fileSystemRepresentation, snap.fileSystemRepresentation)) { NSData *a = pack_dir(snap, newest); [fm removeItemAtPath:snap error:nil]; return a; }
     for (int tries = 0; tries < 3; tries++) {
         uint64_t c0 = dm_fs_commit_count(); NSData *a = pack_dir(g_dir, newest);
         if (dm_fs_commit_count() == c0) return a;

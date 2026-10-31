@@ -1,5 +1,5 @@
 """NSP script Mac-only build (scripts/build_ipa_from_nsp.py --platform mac): the shader steps build only the Mac's libraries, each output keeps its own reuse key, a Mac-only build is
-reused after an iOS build (which builds the Mac's too) and an iOS build is not reused after a Mac-only one, neither key without the Mac libraries' stamp (inputs.tsv, which the one
+rebuilt after an iOS-only NVN build and an iOS build is not reused after a Mac-only one but builds its Mac libraries again (kept for the Mac run command), neither key without the Mac outputs' stamp (inputs.tsv, which the one
 chain version's c1_full.tsv / cb_extent.tsv name); the run command's environment file is read as the iOS app reads it.
 No game files, keys or Xcode needed (temporary files only in a temporary folder)."""
 import importlib.util
@@ -36,8 +36,12 @@ class Base(unittest.TestCase):
             log.write_text('macosx: 3 shaders\n' + ('iphoneos: 3 shaders\n' if '--ios' in a else ''))
         elif tool == 'own_compilers.py':   # a full dmsh_build.py run: the libraries, their stamp, and the profile's tables naming it
             outs = [self.sh / 'cache'] + ([Path(env['IOSOUT'])] if 'IOSOUT' in env else [])
+            targets = (env or {}).get('DMSH_TARGETS', 'mac').split(',')
             for o in outs:
-                (o / f'b-{CHAIN}').mkdir(parents=True, exist_ok=True); (o / f'b-{CHAIN}' / 'k_b.metallib').write_bytes(b'lib')
+                d = o / f'b-{CHAIN}'; shutil.rmtree(d, ignore_errors=True); d.mkdir(parents=True)
+                target = 'mac' if o == self.sh / 'cache' else 'ios'
+                if target in targets: (d / 'k_b.metallib').write_bytes(b'lib')
+                if target == 'mac': (d / 'k_b.metal').write_text('MSL'); (d / 'k_b.json').write_text('{}')
                 (o / f'b-{CHAIN}' / 'inputs.tsv').write_text(f'# stamp\ngame\t0100535012974000\ninputs\t{INPUTS}\n')
             for n in ('c1_full.tsv', 'cb_extent.tsv'): (self.tmp / n).write_text(f'# chain b-{CHAIN} inputs {INPUTS} 2026-10-23T00:00:00+00:00\n')
             log.write_text('shaders 1: ok 1\n')
@@ -92,12 +96,78 @@ class Nvn(Base):
     def test_mac_after_ios(self):
         self.assertEqual(self.build(False), self.sh / 'ios')
         self.assertEqual(self.ran[0][1]['IOSOUT'], str(self.sh / 'ios'))
-        (self.sh / f'mac-b-{CHAIN}.key').unlink()   # an iOS build from before Mac-only builds
+        self.assertEqual(self.ran[0][1]['DMSH_TARGETS'], 'ios')
+        self.assertFalse((self.sh / f'mac-b-{CHAIN}.key').exists())
+        self.assertFalse(list((self.sh / 'cache').glob('b-*/*.metallib')))
+        self.assertEqual(self.build(True), self.sh / 'cache'); self.assertEqual(len(self.ran), 1)
+        self.assertEqual(self.ran[0][1]['DMSH_TARGETS'], 'mac')
         self.assertEqual(self.build(True), self.sh / 'cache'); self.assertEqual(self.ran, [])
 
-    def test_ios_after_mac(self):
+    def test_ios_repeat_reuses_its_target(self):
+        self.build(False)
+        self.assertEqual(self.build(False), self.sh / 'ios'); self.assertEqual(self.ran, [])
+
+    def test_ios_after_mac_keeps_mac_libraries(self):   # the Mac run command a Mac-only build printed still finds its libraries after an iOS build
         self.build(True)
         self.assertEqual(self.build(False), self.sh / 'ios'); self.assertEqual(len(self.ran), 1)
+        self.assertEqual(self.ran[0][1]['DMSH_TARGETS'], 'mac,ios')
+        self.assertTrue((self.sh / 'cache' / f'b-{CHAIN}' / 'k_b.metallib').is_file()); self.assertTrue((self.sh / 'ios' / f'b-{CHAIN}' / 'k_b.metallib').is_file())
+        self.assertEqual(self.build(True), self.sh / 'cache'); self.assertEqual(self.ran, [])   # both keys written: the Mac build is reused
+        self.assertEqual(self.build(False), self.sh / 'ios'); self.assertEqual(self.ran, [])
+
+    def test_ios_after_mac_of_another_chain(self):   # libraries of another chain version are not this build's to keep
+        self.build(True)
+        (self.sh / 'cache' / f'b-{CHAIN}').rename(self.sh / 'cache' / 'b-ba9876543210')
+        self.build(False); self.assertEqual(self.ran[0][1]['DMSH_TARGETS'], 'ios')
+
+    def stale(self):   # two older chain versions' libraries and keys, in both library folders
+        for old in ('157e1b96c8da', 'a78f966a7b38'):
+            for d in (self.sh / 'cache', self.sh / 'ios'):
+                (d / f'b-{old}').mkdir(parents=True); (d / f'b-{old}' / 'k_b.metallib').write_bytes(b'x' * 100)
+            (self.sh / 'ios' / f'b-{old}.key').write_text('K\n'); (self.sh / f'mac-b-{old}.key').write_text('K\n')
+
+    def left(self):
+        return sorted(str(p.relative_to(self.sh)) for p in self.sh.rglob('*') if p.parent.name in ('cache', 'ios', 'shader') and (p.name.startswith(('b-', 'mac-b-'))))
+
+    def test_prune_stale_chains_after_success(self):   # the old chain versions go with their keys, the current one stays, the size is logged once
+        self.stale()
+        said = []
+        with mock.patch.object(nsp, 'say', said.append):
+            self.assertEqual(self.build(False), self.sh / 'ios')
+        self.assertEqual(self.left(), [f'cache/b-{CHAIN}', f'ios/b-{CHAIN}', f'ios/b-{CHAIN}.key'])
+        self.assertTrue((self.sh / 'ios' / f'b-{CHAIN}' / 'k_b.metallib').is_file())
+        self.assertEqual([m for m in said if m.startswith('removed old shader libraries')], ['removed old shader libraries b-157e1b96c8da, b-a78f966a7b38 (0.4 KB)'])
+        self.stale(); said.clear()   # a reused build prunes too
+        with mock.patch.object(nsp, 'say', said.append):
+            self.build(False)
+        self.assertEqual(self.ran, []); self.assertEqual(len(self.left()), 3)
+
+    def test_failed_build_keeps_stale_chains(self):   # nothing goes before the new libraries exist
+        self.stale(); before = self.left()
+        def failing(cmd, log, env=None, cwd=None, on_line=None): raise nsp.BuildError('translator failed')
+        with mock.patch.object(nsp, 'run', failing), self.assertRaises(nsp.BuildError): self.build(False)
+        self.assertEqual(self.left(), before)
+        with mock.patch.object(nsp, 'run', lambda *a, **k: None), self.assertRaises(nsp.BuildError): self.build(False)   # no libraries written
+        self.assertEqual(self.left(), before)
+
+    def test_failed_prune_keeps_the_build(self):   # a folder that cannot be removed is a [RED] line; the others go and the build still returns its libraries
+        self.stale()
+        real, said = nsp.rmtree, []
+        def stuck(p):
+            if p.name == 'b-157e1b96c8da' and p.parent.name == 'ios': raise PermissionError(13, 'Permission denied', str(p))
+            real(p)
+        with mock.patch.object(nsp, 'rmtree', stuck), mock.patch.object(nsp, 'say', said.append):
+            self.assertEqual(self.build(False), self.sh / 'ios')
+        self.assertEqual(self.left(), sorted([f'cache/b-{CHAIN}', 'ios/b-157e1b96c8da', f'ios/b-{CHAIN}', f'ios/b-{CHAIN}.key']))
+        self.assertEqual(len([m for m in said if m.startswith('[RED] could not remove old shader libraries')]), 1)
+        self.assertEqual(len([m for m in said if m.startswith('removed old shader libraries b-157e1b96c8da, b-a78f966a7b38 (')]), 1)
+
+    def test_prune_ignores_other_names(self):   # only b-<12 hex> folders and their keys, never the compile cache or another folder
+        self.build(True)
+        for n in ('cas', 'b-notahexchain', 'b-0123456789abcd', 'mine'): (self.sh / 'cache' / n).mkdir()
+        (self.sh / 'cache' / 'b-ffffffffffff').write_text('a file, not a library folder')
+        self.build(False)
+        self.assertEqual(sorted(p.name for p in (self.sh / 'cache').iterdir()), sorted(['b-0123456789abcd', 'b-ffffffffffff', 'b-notahexchain', f'b-{CHAIN}', 'cas', 'mine']))
 
     def test_no_stamp(self):   # Mac libraries no full build stamped (an interrupted one): no table can name them, so neither key reuses them
         self.build(False)
@@ -109,6 +179,27 @@ class Nvn(Base):
         self.build(True)
         (self.tmp / 'cb_extent.tsv').write_text(f'# chain b-{CHAIN} inputs bbbbbbbbbbbb 2026-10-23T00:00:00+00:00\n')
         self.assertEqual(self.build(True), self.sh / 'cache'); self.assertEqual([Path(c[1]).name for c, _ in self.ran], ['cb_extent.py'])
+
+    def test_split_pairs_invalidate_shader_reuse(self):
+        # A registered profile may have no pso_pairs.tsv: the split's copy feeds vs_pad.
+        def fingerprint(*args, **kwargs):
+            path = next(x[1][0] for x in args if isinstance(x, tuple) and x[0] == 'files' and x[1] and x[1][0].name == 'pso_pairs.tsv')
+            return str(path.read_bytes() if path.is_file() else b'missing')
+        with mock.patch.object(nsp, 'fingerprint', side_effect=fingerprint):
+            self.build(True); self.assertEqual(len(self.ran), 1)
+            self.build(True); self.assertEqual(self.ran, [])
+            (self.sh / 'pso_pairs.tsv').write_text('v\tf1\n')
+            self.build(True); self.assertEqual(len(self.ran), 1)
+            (self.sh / 'pso_pairs.tsv').write_text('v\tf2\n')
+            self.build(True); self.assertEqual(len(self.ran), 1)
+            self.build(True); self.assertEqual(self.ran, [])
+
+    def test_shader_watch_finishes_extra_pairs_last(self):
+        (self.tmp / 'shader_map.tsv').write_text('p.bin\t0\tvs\ta\tsrc\np.bin\t1\tps\tb\tsrc\np.bin\t2\tvs\tc\tsrc\n')
+        (self.tmp / 'shader_pairs.tsv').write_text('c\tb\n')
+        pso = self.tmp / 'pso_pairs.tsv'; pso.write_text('a\tb\n')
+        watch = nsp.ShaderWatch(self.g, self.tmp, self.tmp, pso)
+        self.assertEqual(list(watch.pos), ['b', 'a', 'c'])
 
 
 class EnvFile(Base):
