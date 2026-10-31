@@ -287,13 +287,6 @@ DM_SYMCHECK	diagnostic	`=1` checks every hashed module symbol lookup against a l
 DM_TBUF_ALIGN	diagnostic	`=<bytes>` uses that value as the linear-texture alignment for buffer textures when it is larger than the device's `minimumLinearTextureAlignmentForPixelFormat`: a Mac can then reproduce a phone's larger alignment (a 64-byte one fails the buffers a device with 64 bytes cannot view), to check `tbuf_as_2d`'s aligned-row copy
 DM_TEAM_ID	switch	Apple team ID for the per-game Xcode project, used when `--team-id` / `TEAM_ID` is not given; `build_ipa.sh` uses the placeholder `0000000000` (unsigned) when unset
 DM_TEMP	path	Temporary storage folder (default `$DM_ROOT/run/platform/temp`); stand-in system data goes in `<DM_TEMP>_sysdata`; the Mac launcher, the iOS app and the NSP script set it
-DM_TEMPORAL	switch	`=1` replaces the game's upscale draw with MetalFX temporal scaling (profile keys `temporal_upscale`, `temporal_context`)
-DM_TEMPORAL_AB	diagnostic	`=<frames>[:flip]` alternates temporal upscaling with the game's upscale (or reversed jitter signs) every that many frames
-DM_TEMPORAL_JTEST	diagnostic	`=<pixels>` a fixed jitter on every other `DM_TEMPORAL_AB` span, to see which way the picture moves
-DM_TEMPORAL_MVCHECK	diagnostic	`=1` logs how well the motion vectors reproject the last frame
-DM_TEMPORAL_REACTIVE	switch	`=<gain>` the reactive mask's gain for temporal upscaling (default 8, 0 = off)
-DM_TEMPORAL_SHARPEN	switch	`=0..1` sharpening after temporal upscaling (default 0.5)
-DM_TEMPORAL_SIGNS	diagnostic	`=jx,jy,mv` multiplies the jitter offsets and motion vectors handed to MetalFX by 1 or -1
 DM_TEST_ARCHIVE_CONSTANTS	test	Use optional function constants in the synthetic pipeline archive restart fixture
 DM_TEST_ARCHIVE_MIXED	test	Mix a newly compiled shader function with compacted bases in the archive restart fixture
 DM_TEST_BORDER	test	Path to the native t_border executable that test_dmsh_border.py runs a rewritten shader through on the GPU (`make check_t_border` sets it)

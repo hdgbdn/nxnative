@@ -92,8 +92,6 @@ SHADER_BINDING = [
 # Profile switches: (key, the start of its value ('' = any), entry). A key is per-game data, so `game`; its goal is `host` where it is the semantics every game should get
 DEFAULT_SOON = 'a default for every game after `regress.py check` on the games'
 SWITCH_BINDING = [
-    ('temporal_upscale', '', {'what': 'the upscale draw DM_TEMPORAL=1 replaces with MetalFX temporal scaling', 'now': 'game', 'goal': 'game', 'purpose': 'rendering', 'why': "which draw is the game's own upscale is a fact of its shaders"}),
-    ('temporal_context', '', {'what': 'the camera uniform block temporal upscaling jitters and reads', 'now': 'game', 'goal': 'game', 'purpose': 'rendering', 'why': "the block's slot and layout are the game's own"}),
     ('render_cond', '', {'what': 'NVN conditional rendering', 'now': 'game', 'goal': 'host', 'purpose': 'rendering',
      'why': f'what the GPU does; off by default only because other games drew everything before: {DEFAULT_SOON}'}),
     ('gpu_timestamps', '', {'what': 'timestamp reports per segment', 'now': 'game', 'goal': 'host', 'purpose': 'rendering', 'why': f'what hardware records: {DEFAULT_SOON}'}),
